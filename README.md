@@ -49,7 +49,7 @@ sudo loginctl enable-linger mitch
 2. Create `/opt/freedns/config.json` (root-owned) on the main server, e.g.:
    ```json
    {
-     "nginx_conf_path": "/etc/nginx/nginx.conf",
+     "nginx_conf_path": "/etc/nginx/conf.d/1-freedns-rotation.conf",
      "nginx_locations_snippet": "/etc/nginx/snippets/mitch-main-locations.conf",
      "certbot_email": "",
      "protected_domains": ["mitch.pro"],
@@ -57,6 +57,7 @@ sudo loginctl enable-linger mitch
      "max_retire_per_run": 20
    }
    ```
+   - `nginx_conf_path`: use a dedicated file inside `http {}` (e.g. `conf.d/`), not `nginx.conf` or your main site config. Create it empty first (`touch`), owned by root.
    - `protected_domains`: names (and all their subdomains) the sync will never serve or delete certs for. Every `server_name` already in nginx outside the managed `BEGIN/END DOMAIN` blocks (from `nginx -T`) is protected automatically.
    - Only certs this script issued itself are ever deleted; a requested name with a pre-existing cert is refused.
    - `max_fqdns` caps one request; `max_retire_per_run` caps cert deletions per run (the rest are deferred to later runs).

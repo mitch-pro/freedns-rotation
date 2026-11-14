@@ -169,7 +169,12 @@ def update_nginx_conf(nginx_conf: Path, managed_body: str) -> list[str]:
     shutil.copy2(nginx_conf, backup)
     try:
         nginx_conf.write_text(new_content, encoding="utf-8")
-        subprocess.run(["nginx", "-t"], check=True, capture_output=True, text=True)
+        res = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"nginx -t rejected the updated {nginx_conf} (restored from backup):\n"
+                f"{res.stderr.strip()}"
+            )
     except Exception:
         shutil.copy2(backup, nginx_conf)
         raise
@@ -321,9 +326,13 @@ def main() -> int:
 
     # Serialize runs: overlapping syncs would race on nginx.conf and its single backup file.
     lock_path = Path(config.get("lock_file", str(base_dir / "sync.lock")))
-    with lock_path.open("a") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        sync(working_fqdns, config, base_dir)
+    try:
+        with lock_path.open("a") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            sync(working_fqdns, config, base_dir)
+    except Exception as exc:
+        print(f"[nginx-sync] ERROR: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

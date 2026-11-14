@@ -583,7 +583,7 @@ def trigger_nginx_sync(
     if not host:
         raise RuntimeError("nginx_ssh_host is required for SSH nginx sync")
 
-    cmd = ["ssh", "-o", "BatchMode=yes", "-p", str(port)]
+    cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-p", str(port)]
     ssh_key = str(config.get("nginx_ssh_key", "")).strip()
     if ssh_key:
         cmd.extend(["-i", ssh_key])
