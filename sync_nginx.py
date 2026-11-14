@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Remote SSH helper to sync verified working FreeDNS domains into nginx.conf and Certbot.
 
-Intended to be invoked over SSH via a forced-command in authorized_keys on the main server:
-  command="/usr/bin/python3 /opt/freedns/sync_nginx.py --stdin",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 ...
+Intended to be invoked over SSH via a forced-command in authorized_keys of a dedicated
+user on the main server, which may only run this script via sudo:
+  authorized_keys: restrict,from="<rotator-ip>",command="sudo -n /usr/bin/python3 -I /opt/freedns/sync_nginx.py --stdin" ssh-ed25519 ...
+  sudoers:         freedns-sync ALL=(root) NOPASSWD: /usr/bin/python3 -I /opt/freedns/sync_nginx.py --stdin
+
+Trust model: the caller (rotator box) is untrusted. It can only send a list of FQDNs. This
+script never touches certs it did not issue itself, never serves names already configured
+elsewhere in nginx or listed in `protected_domains`, and limits how much one run can do.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -24,6 +32,11 @@ DOMAIN_BLOCK_RE = re.compile(
 FQDN_RE = re.compile(
     r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
+SERVER_NAME_RE = re.compile(r"(?<![\w-])server_name\s+([^;]+);")
+
+MAX_STDIN_BYTES = 64 * 1024
+DEFAULT_MAX_FQDNS = 100
+DEFAULT_MAX_RETIRE_PER_RUN = 20
 
 
 def validate_fqdn(name: str) -> str:
@@ -37,6 +50,64 @@ def load_sync_config(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         return {}
     return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+class NameGuard:
+    """Names this script must never serve or touch: everything nginx already serves outside
+    our managed blocks, plus `protected_domains` from the root-owned config (and their subdomains)."""
+
+    def __init__(self, exact: set[str], suffixes: set[str]) -> None:
+        self.exact = exact
+        self.suffixes = suffixes
+
+    def is_protected(self, fqdn: str) -> bool:
+        if fqdn in self.exact:
+            return True
+        return any(fqdn == s or fqdn.endswith("." + s) for s in self.suffixes)
+
+
+def build_name_guard(config: dict[str, Any]) -> NameGuard:
+    # Fail closed: if we cannot see the full nginx config we cannot tell what is protected.
+    res = subprocess.run(["nginx", "-T"], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"nginx -T failed; refusing to sync: {res.stderr.strip()}")
+    outside_managed = DOMAIN_BLOCK_RE.sub("\n", res.stdout)
+
+    exact: set[str] = set()
+    suffixes: set[str] = set()
+    for match in SERVER_NAME_RE.finditer(outside_managed):
+        for name in match.group(1).split():
+            name = name.strip().lower().rstrip(".")
+            if not name or name == "_" or name.startswith("~"):
+                continue
+            if name.startswith("*."):
+                suffixes.add(name[2:])
+            elif name.startswith("."):
+                suffixes.add(name[1:])
+            else:
+                exact.add(name)
+
+    for name in config.get("protected_domains", []):
+        suffixes.add(validate_fqdn(str(name)))
+    return NameGuard(exact, suffixes)
+
+
+def load_managed(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    managed: set[str] = set()
+    for x in json.loads(path.read_text(encoding="utf-8")):
+        try:
+            managed.add(validate_fqdn(str(x)))
+        except ValueError:
+            continue
+    return managed
+
+
+def save_managed(path: Path, managed: set[str]) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(sorted(managed), indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def cert_exists(fqdn: str, letsencrypt_dir: Path) -> bool:
@@ -132,17 +203,27 @@ def obtain_cert(fqdn: str, email: str) -> bool:
     return True
 
 
-def delete_cert(fqdn: str) -> None:
-    subprocess.run(
+def delete_cert(fqdn: str) -> bool:
+    res = subprocess.run(
         ["certbot", "delete", "--cert-name", fqdn, "--non-interactive"],
         capture_output=True,
         text=True,
     )
+    if res.returncode != 0:
+        print(f"[certbot] Failed to delete {fqdn}: {res.stderr.strip()}", file=sys.stderr)
+        return False
     print(f"[certbot] Deleted retired certificate for {fqdn}")
+    return True
 
 
 def sync(working_fqdns: list[str], config: dict[str, Any], base_dir: Path) -> None:
-    fqdns = sorted({validate_fqdn(d) for d in working_fqdns})
+    max_fqdns = int(config.get("max_fqdns", DEFAULT_MAX_FQDNS))
+    max_retire = int(config.get("max_retire_per_run", DEFAULT_MAX_RETIRE_PER_RUN))
+
+    requested = sorted({validate_fqdn(d) for d in working_fqdns})
+    if len(requested) > max_fqdns:
+        raise ValueError(f"Refusing {len(requested)} domains (max_fqdns={max_fqdns})")
+
     nginx_conf = Path(config.get("nginx_conf_path", "/etc/nginx/nginx.conf"))
     locations_snippet = str(
         config.get("nginx_locations_snippet", "/etc/nginx/snippets/mitch-main-locations.conf")
@@ -153,22 +234,28 @@ def sync(working_fqdns: list[str], config: dict[str, Any], base_dir: Path) -> No
         config.get("managed_certs_file", str(base_dir / "managed_certs.json"))
     )
 
-    previously_managed: set[str] = set()
-    if managed_certs_path.exists():
-        try:
-            previously_managed = {
-                validate_fqdn(x)
-                for x in json.loads(managed_certs_path.read_text(encoding="utf-8"))
-            }
-        except Exception:
-            previously_managed = set()
+    guard = build_name_guard(config)
+
+    # `managed` = certs this script itself issued. Never adopt pre-existing certs, and drop
+    # anything protected (covers entries adopted by older versions of this script).
+    managed = load_managed(managed_certs_path)
+    for name in sorted(managed):
+        if guard.is_protected(name):
+            print(f"[nginx-sync] Dropping protected name from managed list: {name}", file=sys.stderr)
+            managed.discard(name)
+
+    fqdns: list[str] = []
+    for fqdn in requested:
+        if guard.is_protected(fqdn):
+            print(f"[nginx-sync] Refusing protected/externally configured name: {fqdn}", file=sys.stderr)
+        elif fqdn not in managed and cert_exists(fqdn, letsencrypt_dir):
+            print(f"[nginx-sync] Refusing {fqdn}: certificate exists but was not issued by this script", file=sys.stderr)
+        else:
+            fqdns.append(fqdn)
 
     # 1. Write HTTP blocks for new domains so `certbot --nginx certonly` can verify them.
     initial_blocks = render_server_blocks(fqdns, locations_snippet, letsencrypt_dir)
-    previous_in_conf = update_nginx_conf(nginx_conf, initial_blocks)
-    for d in previous_in_conf:
-        if FQDN_RE.match(d):
-            previously_managed.add(d)
+    update_nginx_conf(nginx_conf, initial_blocks)
     reload_nginx()
 
     # 2. Obtain Certbot certs for any working domain missing one.
@@ -177,21 +264,21 @@ def sync(working_fqdns: list[str], config: dict[str, Any], base_dir: Path) -> No
         if not cert_exists(fqdn, letsencrypt_dir):
             if obtain_cert(fqdn, certbot_email):
                 newly_certified = True
-                previously_managed.add(fqdn)
-        else:
-            previously_managed.add(fqdn)
+                managed.add(fqdn)
+                save_managed(managed_certs_path, managed)
 
-    # 3. Clean up certs for retired domains we previously managed.
-    retired = previously_managed - set(fqdns)
-    for old_fqdn in sorted(retired):
-        if cert_exists(old_fqdn, letsencrypt_dir):
-            delete_cert(old_fqdn)
-        previously_managed.discard(old_fqdn)
-
-    managed_certs_path.write_text(
-        json.dumps(sorted(previously_managed), indent=2),
-        encoding="utf-8",
-    )
+    # 3. Delete certs for retired domains this script issued (rate-limited per run;
+    #    the rest stay in the managed list and are retired on later runs).
+    retired = sorted(managed - set(fqdns))
+    if len(retired) > max_retire:
+        print(
+            f"[nginx-sync] {len(retired)} certs to retire; deleting {max_retire} now, deferring the rest",
+            file=sys.stderr,
+        )
+    for old_fqdn in retired[:max_retire]:
+        if not cert_exists(old_fqdn, letsencrypt_dir) or delete_cert(old_fqdn):
+            managed.discard(old_fqdn)
+    save_managed(managed_certs_path, managed)
 
     # 4. Re-render nginx.conf with HTTPS blocks if new certs were issued.
     if newly_certified:
@@ -200,6 +287,19 @@ def sync(working_fqdns: list[str], config: dict[str, Any], base_dir: Path) -> No
         reload_nginx()
 
     print(f"[nginx-sync] Synced {len(fqdns)} working domain(s) to {nginx_conf}")
+
+
+def read_stdin_payload() -> list[str]:
+    raw = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
+    if len(raw) > MAX_STDIN_BYTES:
+        raise ValueError(f"stdin payload exceeds {MAX_STDIN_BYTES} bytes")
+    payload = json.loads(raw.decode("utf-8") or "{}")
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a JSON object")
+    fqdns = payload.get("working_fqdns", [])
+    if not isinstance(fqdns, list) or not all(isinstance(x, str) for x in fqdns):
+        raise ValueError("working_fqdns must be a list of strings")
+    return fqdns
 
 
 def main() -> int:
@@ -217,9 +317,13 @@ def main() -> int:
     if not args.stdin:
         raise SystemExit("Run with --stdin (via SSH forced-command).")
 
-    payload = json.loads(sys.stdin.read() or "{}")
-    working_fqdns = [str(x) for x in payload.get("working_fqdns", [])]
-    sync(working_fqdns, config, base_dir)
+    working_fqdns = read_stdin_payload()
+
+    # Serialize runs: overlapping syncs would race on nginx.conf and its single backup file.
+    lock_path = Path(config.get("lock_file", str(base_dir / "sync.lock")))
+    with lock_path.open("a") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        sync(working_fqdns, config, base_dir)
     return 0
 
 
