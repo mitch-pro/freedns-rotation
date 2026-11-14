@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+config.json
+state.json
+state.tmp
+registry_cache.json
+active_domains.txt
+working_domains.txt
+old_domains.txt

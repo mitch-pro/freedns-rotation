@@ -1,0 +1,31 @@
+{
+  "username": "",
+  "password": "",
+  "dns_cookie": "",
+  "target_domain": "mitch.pro",
+  "max_domains": 55,
+  "rotation_mode": "weekly",
+  "weekday_rotations_per_day": 10,
+  "weekend_rotations_per_day": 5,
+  "speed_multiplier": 1,
+  "word_list": [
+    "mitch",
+    "school",
+    "education",
+    "portal",
+    "notes",
+    "study",
+    "campus",
+    "library",
+    "academy",
+    "class"
+  ],
+  "parent_domains": [],
+  "active_domains_file": "active_domains.txt",
+  "working_domains_file": "working_domains.txt",
+  "old_domains_file": "old_domains.txt",
+  "state_file": "state.json",
+  "web_host": "127.0.0.1",
+  "web_port": 8080,
+  "web_password": "changeme"
+}
