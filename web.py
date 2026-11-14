@@ -714,11 +714,11 @@ async function verifySync() {
     const d = await api('/api/verify-sync');
     if (d.error) return;
     const still = Object.entries(d.still_failing || {});
-    let msg = `Checked ${d.checked} working domain(s).\n`;
+    let msg = `Checked ${d.checked} working domain(s).\\n`;
     if (!d.failing.length) msg += 'All serve valid HTTPS. Nothing to sync.';
     else {
-      msg += `${d.failing.length} were not serving valid HTTPS; ran a sync.\n`;
-      msg += still.length ? `Still failing (${still.length}):\n` + still.map(([f, e]) => `- ${f}: ${e}`).join('\n')
+      msg += `${d.failing.length} were not serving valid HTTPS; ran a sync.\\n`;
+      msg += still.length ? `Still failing (${still.length}):\\n` + still.map(([f, e]) => `- ${f}: ${e}`).join('\\n')
                           : 'All fixed.';
     }
     alert(msg);
