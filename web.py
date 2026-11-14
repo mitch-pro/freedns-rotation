@@ -33,6 +33,7 @@ from rotate import (
     load_config,
     load_state,
     next_active_window_start,
+    normalize_banned_domains,
     parse_iso,
     persist_all_files,
     reauth_client,
