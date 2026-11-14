@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import signal
@@ -413,6 +414,30 @@ def sync_state_with_account(client: BaseFreeDNSClient, state: dict[str, Any]) ->
     state["active_domains"] = synced
 
 
+BANNED_NAME_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9-]{2,63}$")
+
+
+def normalize_banned_domains(raw: Any) -> list[str]:
+    """Parse a comma/whitespace-separated string or list into clean domain names."""
+    items = re.split(r"[,\s]+", raw) if isinstance(raw, str) else [str(x) for x in raw or []]
+    out: list[str] = []
+    for item in items:
+        name = item.strip().lower().rstrip(".")
+        name = name.removeprefix("*.").lstrip(".")
+        if name and BANNED_NAME_RE.match(name) and name not in out:
+            out.append(name)
+    return out
+
+
+def is_banned(name: str, config: dict[str, Any]) -> bool:
+    """True if name equals a banned domain or is a subdomain of one (groups.id bans x.groups.id)."""
+    name = name.lower().rstrip(".")
+    return any(
+        name == b or name.endswith("." + b)
+        for b in normalize_banned_domains(config.get("banned_domains", []))
+    )
+
+
 def choose_parent_domains(
     client: BaseFreeDNSClient, config: dict[str, Any], cache_dir: Path | None = None
 ) -> list[RegistryDomain]:
@@ -466,8 +491,9 @@ def create_unique_subdomain(
     registry_domains: list[RegistryDomain],
 ) -> dict[str, Any]:
     """Pick a unique prefix (word_list first, then 1-2 word diceware) and create it."""
+    registry_domains = [r for r in registry_domains if not is_banned(r.domain, config)]
     if not registry_domains:
-        raise FreeDNSError("No parent registry domains available.")
+        raise FreeDNSError("No parent registry domains available (all banned?).")
 
     active_fqdns = {d["fqdn"].lower() for d in state["active_domains"]}
     old_fqdns = {d["fqdn"].lower() for d in state["old_domains"]}
@@ -546,6 +572,16 @@ def rotate_once(
     max_domains = int(config["max_domains"])
     active = sorted(state["active_domains"], key=lambda d: d["created_at"])
 
+    # Retire anything under a banned domain first.
+    for banned in [d for d in active if is_banned(d["fqdn"], config)]:
+        client.delete_subdomain(banned["data_id"])
+        active.remove(banned)
+        retired = dict(banned)
+        retired["retired_at"] = utc_now().isoformat()
+        retired["retired_reason"] = "banned"
+        state["old_domains"].append(retired)
+        print(f"[deleted:banned] {banned['fqdn']} (id={banned['data_id']})")
+
     while len(active) >= max_domains:
         oldest = active.pop(0)
         client.delete_subdomain(oldest["data_id"])
@@ -572,7 +608,9 @@ def trigger_nginx_sync(
         return False
 
     working_fqdns = sorted(
-        d["fqdn"].lower() for d in state.get("active_domains", []) if d.get("working")
+        d["fqdn"].lower()
+        for d in state.get("active_domains", [])
+        if d.get("working") and not is_banned(d["fqdn"], config)
     )
     if not force and working_fqdns == state.get("last_synced_working", []):
         return False

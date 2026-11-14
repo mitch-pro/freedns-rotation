@@ -415,6 +415,8 @@ class RotatorController:
                 else:
                     words = [str(w).strip().lower() for w in raw if str(w).strip()]
                 self.config["word_list"] = words
+            if "banned_domains" in updates:
+                self.config["banned_domains"] = normalize_banned_domains(updates["banned_domains"])
 
             # Persist config without overwriting env-only secrets if empty.
             with self.config_path.open("w", encoding="utf-8") as f:
@@ -494,6 +496,7 @@ class RotatorController:
                 "weekday_rotations_per_day": int(self.config["weekday_rotations_per_day"]),
                 "weekend_rotations_per_day": int(self.config["weekend_rotations_per_day"]),
                 "word_list": self.config.get("word_list", []),
+                "banned_domains": normalize_banned_domains(self.config.get("banned_domains", [])),
                 "next_rotation_at": self.next_rot.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "next_rotation_in": format_duration((self.next_rot - now).total_seconds()),
                 "active_count": len(active_rows),
@@ -634,6 +637,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div><label class="label">SSH Host<input id="cfgSshHost" type="text" placeholder="mitch.pro"></label></div>
       <div><label class="label">SSH Port<input id="cfgSshPort" type="number" placeholder="22"></label></div>
       <div style="grid-column: span 2;"><label class="label">Word List (comma-separated)<input id="cfgWords" type="text"></label></div>
+      <div style="grid-column: span 2;"><label class="label">Banned Domains (comma-separated; also bans subdomains)<input id="cfgBanned" type="text" placeholder="groups.id, example.com"></label></div>
       <div><button class="primary" style="width:100%" onclick="saveConfig()">Save Settings</button></div>
     </div>
   </div>
@@ -692,7 +696,8 @@ async function saveConfig() {
     nginx_ssh_port: parseInt(document.getElementById('cfgSshPort').value || '22', 10),
     speed_multiplier: parseFloat(document.getElementById('cfgSpeed').value),
     max_domains: parseInt(document.getElementById('cfgMax').value, 10),
-    word_list: document.getElementById('cfgWords').value
+    word_list: document.getElementById('cfgWords').value,
+    banned_domains: document.getElementById('cfgBanned').value
   });
   cfgLoaded = false;
 }
@@ -735,6 +740,7 @@ async function refresh() {
     document.getElementById('cfgSpeed').value = d.speed_multiplier;
     document.getElementById('cfgMax').value = d.max_domains;
     document.getElementById('cfgWords').value = d.word_list.join(', ');
+    document.getElementById('cfgBanned').value = (d.banned_domains || []).join(', ');
     cfgLoaded = true;
   }
 

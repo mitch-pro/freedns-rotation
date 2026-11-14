@@ -23,6 +23,7 @@
     "class"
   ],
   "parent_domains": [],
+  "banned_domains": [],
   "active_domains_file": "active_domains.txt",
   "working_domains_file": "working_domains.txt",
   "old_domains_file": "old_domains.txt",
