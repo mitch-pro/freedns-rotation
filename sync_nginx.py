@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Privileged helper to sync verified working FreeDNS domains into nginx.conf and Certbot.
+"""Remote SSH helper to sync verified working FreeDNS domains into nginx.conf and Certbot.
 
-Designed to be invoked either:
-  1. Locally via a locked-down sudoers rule:
-       mitch ALL=(root) NOPASSWD: /usr/bin/python3 /home/mitch/freedns/sync_nginx.py
-  2. Remotely over SSH via a forced-command in authorized_keys:
-       command="/usr/bin/python3 /opt/freedns/sync_nginx.py --stdin",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 ...
+Intended to be invoked over SSH via a forced-command in authorized_keys on the main server:
+  command="/usr/bin/python3 /opt/freedns/sync_nginx.py --stdin",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 ...
 """
 
 from __future__ import annotations
@@ -91,9 +88,7 @@ def render_server_blocks(
 
 
 def update_nginx_conf(nginx_conf: Path, managed_body: str) -> list[str]:
-    """Strip all old # --- BEGIN DOMAIN: ... --- blocks and append current ones.
-    Returns list of domain names that were previously in nginx.conf.
-    """
+    """Strip old # --- BEGIN DOMAIN: ... --- blocks and append current ones."""
     content = nginx_conf.read_text(encoding="utf-8")
     existing_domains = [m.group(1).strip().lower() for m in DOMAIN_BLOCK_RE.finditer(content)]
     stripped = DOMAIN_BLOCK_RE.sub("\n", content).rstrip()
@@ -114,14 +109,10 @@ def reload_nginx() -> None:
     subprocess.run(["systemctl", "reload", "nginx"], check=True)
 
 
-def obtain_cert(
-    fqdn: str,
-    email: str,
-    method: str,
-    webroot: str,
-) -> bool:
+def obtain_cert(fqdn: str, email: str) -> bool:
     cmd = [
         "certbot",
+        "--nginx",
         "certonly",
         "--non-interactive",
         "--agree-tos",
@@ -131,13 +122,8 @@ def obtain_cert(
         cmd.extend(["--email", email])
     else:
         cmd.append("--register-unsafely-without-email")
-
-    if method == "webroot":
-        cmd.extend(["--webroot", "-w", webroot])
-    else:
-        cmd.append("--nginx")
-
     cmd.extend(["-d", fqdn])
+
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         print(f"[certbot] Failed for {fqdn}: {res.stderr.strip()}", file=sys.stderr)
@@ -155,11 +141,7 @@ def delete_cert(fqdn: str) -> None:
     print(f"[certbot] Deleted retired certificate for {fqdn}")
 
 
-def sync(
-    working_fqdns: list[str],
-    config: dict[str, Any],
-    base_dir: Path,
-) -> None:
+def sync(working_fqdns: list[str], config: dict[str, Any], base_dir: Path) -> None:
     fqdns = sorted({validate_fqdn(d) for d in working_fqdns})
     nginx_conf = Path(config.get("nginx_conf_path", "/etc/nginx/nginx.conf"))
     locations_snippet = str(
@@ -167,8 +149,6 @@ def sync(
     )
     letsencrypt_dir = Path(config.get("letsencrypt_dir", "/etc/letsencrypt"))
     certbot_email = str(config.get("certbot_email", "")).strip()
-    certbot_method = str(config.get("certbot_method", "nginx")).strip()
-    certbot_webroot = str(config.get("certbot_webroot", "/var/www/html")).strip()
     managed_certs_path = Path(
         config.get("managed_certs_file", str(base_dir / "managed_certs.json"))
     )
@@ -183,7 +163,7 @@ def sync(
         except Exception:
             previously_managed = set()
 
-    # 1. Write initial HTTP blocks for any new domains so Certbot HTTP-01 can verify them.
+    # 1. Write HTTP blocks for new domains so `certbot --nginx certonly` can verify them.
     initial_blocks = render_server_blocks(fqdns, locations_snippet, letsencrypt_dir)
     previous_in_conf = update_nginx_conf(nginx_conf, initial_blocks)
     for d in previous_in_conf:
@@ -195,13 +175,13 @@ def sync(
     newly_certified = False
     for fqdn in fqdns:
         if not cert_exists(fqdn, letsencrypt_dir):
-            if obtain_cert(fqdn, certbot_email, certbot_method, certbot_webroot):
+            if obtain_cert(fqdn, certbot_email):
                 newly_certified = True
                 previously_managed.add(fqdn)
         else:
             previously_managed.add(fqdn)
 
-    # 3. Clean up certs for domains we previously certified that are no longer working/active.
+    # 3. Clean up certs for retired domains we previously managed.
     retired = previously_managed - set(fqdns)
     for old_fqdn in sorted(retired):
         if cert_exists(old_fqdn, letsencrypt_dir):
@@ -234,19 +214,11 @@ def main() -> int:
         config_path = base_dir / config_path
     config = load_sync_config(config_path)
 
-    if args.stdin:
-        payload = json.loads(sys.stdin.read() or "{}")
-        working_fqdns = [str(x) for x in payload.get("working_fqdns", [])]
-    else:
-        state_path = base_dir / config.get("state_file", "state.json")
-        if not state_path.exists():
-            working_fqdns = []
-        else:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            working_fqdns = [
-                d["fqdn"] for d in state.get("active_domains", []) if d.get("working")
-            ]
+    if not args.stdin:
+        raise SystemExit("Run with --stdin (via SSH forced-command).")
 
+    payload = json.loads(sys.stdin.read() or "{}")
+    working_fqdns = [str(x) for x in payload.get("working_fqdns", [])]
     sync(working_fqdns, config, base_dir)
     return 0
 

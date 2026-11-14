@@ -33,20 +33,57 @@ from freedns_client import (
     SubdomainTakenError,
 )
 
-ROTATION_MODES: dict[str, tuple[int, int]] = {
-    "weekly": (10, 5),  # ~6.4 days (~1 week) for 55 domains
-    "2day": (28, 27),   # ~2.0 days for 55 domains
-}
+def sync_rotation_rates(config: dict[str, Any]) -> tuple[int, int]:
+    """Compute effective (weekday, weekend) rotations/day from weekly_enabled + daily_enabled."""
+    weekly = bool(config.get("weekly_enabled", True))
+    daily = bool(config.get("daily_enabled", False))
+    wkday = (10 if weekly else 0) + (28 if daily else 0)
+    wkend = (5 if weekly else 0) + (27 if daily else 0)
+    if wkday == 0 and wkend == 0:
+        wkday, wkend = 10, 5
+    config["weekday_rotations_per_day"] = wkday
+    config["weekend_rotations_per_day"] = wkend
+    return wkday, wkend
 
 
-def apply_rotation_mode(config: dict[str, Any], mode: str | None = None) -> None:
-    """Apply preset weekday/weekend rotation counts for 'weekly' or '2day' mode."""
-    selected = (mode or config.get("rotation_mode") or "weekly").lower().strip()
-    config["rotation_mode"] = selected
-    if selected in ROTATION_MODES:
-        wkday, wkend = ROTATION_MODES[selected]
-        config["weekday_rotations_per_day"] = wkday
-        config["weekend_rotations_per_day"] = wkend
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    hh, mm = value.strip().split(":", 1)
+    return int(hh), int(mm)
+
+
+def is_in_active_hours(dt: datetime, config: dict[str, Any]) -> bool:
+    """Return True if rotation is allowed at dt (respecting active_hours_only & weekends)."""
+    if not config.get("active_hours_only", False):
+        return True
+    local_dt = dt.astimezone()
+    if local_dt.weekday() >= 5:
+        return False
+    sh, sm = _parse_hhmm(str(config.get("active_hours_start", "08:30")))
+    eh, em = _parse_hhmm(str(config.get("active_hours_end", "15:20")))
+    start_t = local_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end_t = local_dt.replace(hour=eh, minute=em, second=0, microsecond=0)
+    return start_t <= local_dt < end_t
+
+
+def next_active_window_start(dt: datetime, config: dict[str, Any]) -> datetime:
+    """Return the next UTC timestamp where active hours allow rotation."""
+    if not config.get("active_hours_only", False):
+        return dt
+    local_dt = dt.astimezone()
+    sh, sm = _parse_hhmm(str(config.get("active_hours_start", "08:30")))
+    eh, em = _parse_hhmm(str(config.get("active_hours_end", "15:20")))
+
+    candidate = local_dt
+    for _ in range(8):
+        start_t = candidate.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_t = candidate.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if candidate.weekday() < 5:
+            if candidate < start_t:
+                return start_t.astimezone(timezone.utc)
+            if start_t <= candidate < end_t:
+                return candidate.astimezone(timezone.utc)
+        candidate = (candidate + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return dt
 
 
 def utc_now() -> datetime:
@@ -100,15 +137,25 @@ def fqdn_exists_in_dns(fqdn: str) -> bool:
 
 
 def get_interval_seconds(dt: datetime, config: dict[str, Any]) -> float:
-    is_weekend = dt.weekday() >= 5
-    rotations = (
-        float(config["weekend_rotations_per_day"])
-        if is_weekend
-        else float(config["weekday_rotations_per_day"])
-    )
+    wkday, wkend = sync_rotation_rates(config)
+    local_dt = dt.astimezone()
+    is_weekend = local_dt.weekday() >= 5
+    rotations = float(wkend if is_weekend else wkday)
     rotations = max(1.0, rotations)
     speed = max(0.001, float(config.get("speed_multiplier", 1.0)))
+    if config.get("active_hours_only", False):
+        sh, sm = _parse_hhmm(str(config.get("active_hours_start", "08:30")))
+        eh, em = _parse_hhmm(str(config.get("active_hours_end", "15:20")))
+        window_secs = max(60.0, ((eh * 60 + em) - (sh * 60 + sm)) * 60.0)
+        return (window_secs / rotations) / speed
     return (86400.0 / rotations) / speed
+
+
+def advance_rotation_time(dt: datetime, config: dict[str, Any]) -> datetime:
+    nxt = dt + timedelta(seconds=get_interval_seconds(dt, config))
+    if config.get("active_hours_only", False) and not is_in_active_hours(nxt, config):
+        return next_active_window_start(nxt, config)
+    return nxt
 
 
 def compute_replacement_times(
@@ -122,16 +169,16 @@ def compute_replacement_times(
     if count == 0:
         return []
 
-    cursor = next_rotation_at
+    cursor = next_active_window_start(next_rotation_at, config)
     # If below max_domains, fill ticks happen before the oldest domain is deleted.
     fill_ticks = max(0, max_domains - count)
     for _ in range(fill_ticks):
-        cursor = cursor + timedelta(seconds=get_interval_seconds(cursor, config))
+        cursor = advance_rotation_time(cursor, config)
 
     schedule: list[datetime] = []
     for _ in range(count):
         schedule.append(cursor)
-        cursor = cursor + timedelta(seconds=get_interval_seconds(cursor, config))
+        cursor = advance_rotation_time(cursor, config)
     return schedule
 
 
@@ -160,7 +207,7 @@ def load_config(path: Path) -> dict[str, Any]:
         cfg["password"] = os.environ["FREEDNS_PASSWORD"]
     if os.environ.get("FREEDNS_COOKIE"):
         cfg["dns_cookie"] = os.environ["FREEDNS_COOKIE"]
-    apply_rotation_mode(cfg)
+    sync_rotation_rates(cfg)
     return cfg
 
 
@@ -517,10 +564,10 @@ def rotate_once(
 def trigger_nginx_sync(
     state: dict[str, Any],
     config: dict[str, Any],
-    base_dir: Path,
+    _base_dir: Path,
     force: bool = False,
 ) -> bool:
-    """Sync verified working domains to nginx + certbot if enabled and changed."""
+    """Sync verified working domains to main server nginx + certbot over SSH."""
     if not force and not config.get("nginx_sync_enabled", False):
         return False
 
@@ -530,29 +577,24 @@ def trigger_nginx_sync(
     if not force and working_fqdns == state.get("last_synced_working", []):
         return False
 
-    method = str(config.get("nginx_sync_method", "local_sudo")).strip()
-    if method == "ssh":
-        target = str(config.get("nginx_ssh_target", "")).strip()
-        if not target:
-            raise RuntimeError("nginx_ssh_target is required when nginx_sync_method is 'ssh'")
-        cmd = ["ssh", "-o", "BatchMode=yes"]
-        ssh_key = str(config.get("nginx_ssh_key", "")).strip()
-        if ssh_key:
-            cmd.extend(["-i", ssh_key])
-        cmd.append(target)
-        res = subprocess.run(
-            cmd,
-            input=json.dumps({"working_fqdns": working_fqdns}),
-            capture_output=True,
-            text=True,
-        )
-    else:
-        script_path = base_dir / "sync_nginx.py"
-        res = subprocess.run(
-            ["sudo", "-n", sys.executable, str(script_path)],
-            capture_output=True,
-            text=True,
-        )
+    user = str(config.get("nginx_ssh_user", "root")).strip() or "root"
+    host = str(config.get("nginx_ssh_host", "")).strip()
+    port = int(config.get("nginx_ssh_port", 22))
+    if not host:
+        raise RuntimeError("nginx_ssh_host is required for SSH nginx sync")
+
+    cmd = ["ssh", "-o", "BatchMode=yes", "-p", str(port)]
+    ssh_key = str(config.get("nginx_ssh_key", "")).strip()
+    if ssh_key:
+        cmd.extend(["-i", ssh_key])
+    cmd.append(f"{user}@{host}")
+
+    res = subprocess.run(
+        cmd,
+        input=json.dumps({"working_fqdns": working_fqdns}),
+        capture_output=True,
+        text=True,
+    )
 
     if res.returncode != 0:
         raise RuntimeError(f"nginx sync failed: {res.stderr.strip() or res.stdout.strip()}")
@@ -666,12 +708,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="FreeDNS subdomain rotation script")
     parser.add_argument("--config", default="config.json", help="Path to config.json")
     parser.add_argument("--speed", type=float, default=None, help="Override speed_multiplier (1 = real-time)")
-    parser.add_argument(
-        "--mode",
-        choices=["weekly", "2day", "custom"],
-        default=None,
-        help="Rotation retention mode: weekly (10/day wkday, 5/day wkend) or 2day (28/day wkday, 27/day wkend)",
-    )
+    parser.add_argument("--weekly", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable weekly schedule (10/5)")
+    parser.add_argument("--daily", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable daily 2-day schedule (28/27)")
+    parser.add_argument("--active-hours", action=argparse.BooleanOptionalAction, default=None, help="Only rotate 08:30-15:20 on weekdays")
     parser.add_argument("--max-domains", type=int, default=None, help="Override max_domains (default 55)")
     parser.add_argument("--once", action="store_true", help="Run one rotation step and exit")
     parser.add_argument("--bootstrap", type=int, default=0, help="Create N subdomains immediately before rotating")
@@ -686,8 +725,13 @@ def main() -> int:
         config_path = base_dir / config_path
 
     config = load_config(config_path)
-    if args.mode is not None:
-        apply_rotation_mode(config, args.mode)
+    if args.weekly is not None:
+        config["weekly_enabled"] = args.weekly
+    if args.daily is not None:
+        config["daily_enabled"] = args.daily
+    if args.active_hours is not None:
+        config["active_hours_only"] = args.active_hours
+    sync_rotation_rates(config)
     if args.speed is not None:
         config["speed_multiplier"] = args.speed
     if args.max_domains is not None:
@@ -762,14 +806,23 @@ def main() -> int:
         )
         while running:
             now = utc_now()
+            if not is_in_active_hours(now, config):
+                next_rot = next_active_window_start(now, config)
+                wait_secs = max(1.0, (next_rot - now).total_seconds())
+                print(f"[active-hours] Outside 08:30-15:20 or weekend; sleeping {format_duration(wait_secs)}")
+                sleep_end = time.monotonic() + min(wait_secs, 60.0)
+                while running and time.monotonic() < sleep_end:
+                    time.sleep(min(0.5, max(0.0, sleep_end - time.monotonic())))
+                continue
+
             try:
                 target_ip = rotate_once(client, state, config, registry_domains)
             except AuthenticationError:
                 print("[auth] Session cookie expired, re-logging in...")
                 client = reauth_client(config)
                 target_ip = rotate_once(client, state, config, registry_domains)
-            interval = get_interval_seconds(now, config)
-            next_rot = now + timedelta(seconds=interval)
+            next_rot = advance_rotation_time(now, config)
+            interval = max(1.0, (next_rot - now).total_seconds())
             state["next_rotation_at"] = next_rot.isoformat()
             persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
 

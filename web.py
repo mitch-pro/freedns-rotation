@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 
 from freedns_client import AuthenticationError, FreeDNSClient
 from rotate import (
-    apply_rotation_mode,
+    advance_rotation_time,
     build_client,
     choose_parent_domains,
     clear_all_domains,
@@ -29,8 +29,10 @@ from rotate import (
     format_duration,
     get_interval_seconds,
     import_account_domains,
+    is_in_active_hours,
     load_config,
     load_state,
+    next_active_window_start,
     parse_iso,
     persist_all_files,
     reauth_client,
@@ -38,6 +40,7 @@ from rotate import (
     resolve_fqdn_ips,
     resolve_target_ip,
     rotate_once,
+    sync_rotation_rates,
     trigger_nginx_sync,
     utc_now,
 )
@@ -253,14 +256,19 @@ class RotatorController:
             if should_run:
                 now = utc_now()
                 if now >= self.next_rot:
-                    try:
-                        self.rotate_now()
-                        last_dns_check = time.monotonic()
-                    except Exception as exc:
-                        with self.lock:
-                            self._last_error = str(exc)
-                            self.running = False
-                        self.log(f"ERROR (paused): {exc}")
+                    with self.lock:
+                        allowed = is_in_active_hours(now, self.config)
+                        if not allowed:
+                            self.next_rot = next_active_window_start(now, self.config)
+                    if allowed:
+                        try:
+                            self.rotate_now()
+                            last_dns_check = time.monotonic()
+                        except Exception as exc:
+                            with self.lock:
+                                self._last_error = str(exc)
+                                self.running = False
+                            self.log(f"ERROR (paused): {exc}")
             time.sleep(0.5)
 
     def start(self) -> None:
@@ -287,8 +295,8 @@ class RotatorController:
                 self.log("Session cookie expired; re-logging in...")
                 self._client = reauth_client(self.config)
                 target_ip = rotate_once(self._client, self.state, self.config, self._registry)
-            interval = get_interval_seconds(now, self.config)
-            self.next_rot = now + timedelta(seconds=interval)
+            self.next_rot = advance_rotation_time(now, self.config)
+            interval = max(1.0, (self.next_rot - now).total_seconds())
             self.state["next_rotation_at"] = self.next_rot.isoformat()
             self._persist(target_ip)
             self._last_error = None
@@ -379,19 +387,27 @@ class RotatorController:
 
     def update_config(self, updates: dict[str, Any]) -> None:
         with self.lock:
-            if "rotation_mode" in updates:
-                apply_rotation_mode(self.config, str(updates["rotation_mode"]))
+            if "weekly_enabled" in updates:
+                self.config["weekly_enabled"] = bool(updates["weekly_enabled"])
+            if "daily_enabled" in updates:
+                self.config["daily_enabled"] = bool(updates["daily_enabled"])
+            if "active_hours_only" in updates:
+                self.config["active_hours_only"] = bool(updates["active_hours_only"])
+            if "nginx_sync_enabled" in updates:
+                self.config["nginx_sync_enabled"] = bool(updates["nginx_sync_enabled"])
+            if "nginx_ssh_user" in updates:
+                self.config["nginx_ssh_user"] = str(updates["nginx_ssh_user"]).strip() or "root"
+            if "nginx_ssh_host" in updates:
+                self.config["nginx_ssh_host"] = str(updates["nginx_ssh_host"]).strip()
+            if "nginx_ssh_port" in updates:
+                self.config["nginx_ssh_port"] = max(1, min(65535, int(updates["nginx_ssh_port"])))
+            sync_rotation_rates(self.config)
             if "speed_multiplier" in updates:
                 self.config["speed_multiplier"] = max(0.01, float(updates["speed_multiplier"]))
             if "max_domains" in updates:
                 self.config["max_domains"] = max(1, int(updates["max_domains"]))
             if "target_domain" in updates and str(updates["target_domain"]).strip():
                 self.config["target_domain"] = str(updates["target_domain"]).strip()
-            if self.config.get("rotation_mode") == "custom":
-                if "weekday_rotations_per_day" in updates:
-                    self.config["weekday_rotations_per_day"] = max(1, int(updates["weekday_rotations_per_day"]))
-                if "weekend_rotations_per_day" in updates:
-                    self.config["weekend_rotations_per_day"] = max(1, int(updates["weekend_rotations_per_day"]))
             if "word_list" in updates:
                 raw = updates["word_list"]
                 if isinstance(raw, str):
@@ -405,7 +421,7 @@ class RotatorController:
                 json.dump(self.config, f, indent=2)
 
             now = utc_now()
-            self.next_rot = now + timedelta(seconds=get_interval_seconds(now, self.config))
+            self.next_rot = advance_rotation_time(now, self.config)
             self.state["next_rotation_at"] = self.next_rot.isoformat()
             target_ip = resolve_target_ip(self.config["target_domain"])
             self._persist(target_ip)
@@ -467,7 +483,13 @@ class RotatorController:
                 "target_domain": self.config["target_domain"],
                 "target_ip": target_ip,
                 "max_domains": int(self.config["max_domains"]),
-                "rotation_mode": self.config.get("rotation_mode", "weekly"),
+                "weekly_enabled": bool(self.config.get("weekly_enabled", True)),
+                "daily_enabled": bool(self.config.get("daily_enabled", False)),
+                "active_hours_only": bool(self.config.get("active_hours_only", False)),
+                "nginx_sync_enabled": bool(self.config.get("nginx_sync_enabled", False)),
+                "nginx_ssh_user": str(self.config.get("nginx_ssh_user", "root")),
+                "nginx_ssh_host": str(self.config.get("nginx_ssh_host", "")),
+                "nginx_ssh_port": int(self.config.get("nginx_ssh_port", 22)),
                 "speed_multiplier": float(self.config.get("speed_multiplier", 1)),
                 "weekday_rotations_per_day": int(self.config["weekday_rotations_per_day"]),
                 "weekend_rotations_per_day": int(self.config["weekend_rotations_per_day"]),
@@ -491,7 +513,9 @@ class RotatorController:
             "target_domain": full["target_domain"],
             "target_ip": full["target_ip"],
             "max_domains": full["max_domains"],
-            "rotation_mode": full["rotation_mode"],
+            "weekly_enabled": full["weekly_enabled"],
+            "daily_enabled": full["daily_enabled"],
+            "active_hours_only": full["active_hours_only"],
             "next_rotation_at": full["next_rotation_at"],
             "next_rotation_in": full["next_rotation_in"],
             "active_count": full["active_count"],
@@ -589,20 +613,26 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="settings">
+    <div style="display:flex;flex-wrap:wrap;gap:18px;margin-bottom:14px;">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+        <input id="cfgWeekly" type="checkbox" style="width:auto;margin:0;"> Weekly (10/day wkday, 5/day wkend)
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+        <input id="cfgDaily" type="checkbox" style="width:auto;margin:0;"> Daily / 2-Day (28/day wkday, 27/day wkend)
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+        <input id="cfgActiveHours" type="checkbox" style="width:auto;margin:0;"> Active Hours Only (08:30–15:20, no weekends)
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+        <input id="cfgNginxSync" type="checkbox" style="width:auto;margin:0;"> Auto-Sync Nginx &amp; Certbot (SSH)
+      </label>
+    </div>
     <div class="settings-grid">
-      <div>
-        <label class="label">Rotation Mode
-          <select id="cfgMode" onchange="onModeChange()">
-            <option value="weekly">Weekly (~1 wk: 10/day wkday, 5/day wkend)</option>
-            <option value="2day">2-Day (~2 days: 28/day wkday, 27/day wkend)</option>
-            <option value="custom">Custom</option>
-          </select>
-        </label>
-      </div>
       <div><label class="label">Speed Multiplier (1 = real-time)<input id="cfgSpeed" type="number" step="any"></label></div>
       <div><label class="label">Max Domains<input id="cfgMax" type="number"></label></div>
-      <div><label class="label">Weekdays / Day<input id="cfgWkday" type="number"></label></div>
-      <div><label class="label">Weekends / Day<input id="cfgWkend" type="number"></label></div>
+      <div><label class="label">SSH User<input id="cfgSshUser" type="text" placeholder="root"></label></div>
+      <div><label class="label">SSH Host<input id="cfgSshHost" type="text" placeholder="mitch.pro"></label></div>
+      <div><label class="label">SSH Port<input id="cfgSshPort" type="number" placeholder="22"></label></div>
       <div style="grid-column: span 2;"><label class="label">Word List (comma-separated)<input id="cfgWords" type="text"></label></div>
       <div><button class="primary" style="width:100%" onclick="saveConfig()">Save Settings</button></div>
     </div>
@@ -651,24 +681,17 @@ async function clearAll() {
   await api('/api/clear-all');
 }
 
-function onModeChange() {
-  const m = document.getElementById('cfgMode').value;
-  if (m === 'weekly') {
-    document.getElementById('cfgWkday').value = 10;
-    document.getElementById('cfgWkend').value = 5;
-  } else if (m === '2day') {
-    document.getElementById('cfgWkday').value = 28;
-    document.getElementById('cfgWkend').value = 27;
-  }
-}
-
 async function saveConfig() {
   await api('/api/config', {
-    rotation_mode: document.getElementById('cfgMode').value,
+    weekly_enabled: document.getElementById('cfgWeekly').checked,
+    daily_enabled: document.getElementById('cfgDaily').checked,
+    active_hours_only: document.getElementById('cfgActiveHours').checked,
+    nginx_sync_enabled: document.getElementById('cfgNginxSync').checked,
+    nginx_ssh_user: document.getElementById('cfgSshUser').value,
+    nginx_ssh_host: document.getElementById('cfgSshHost').value,
+    nginx_ssh_port: parseInt(document.getElementById('cfgSshPort').value || '22', 10),
     speed_multiplier: parseFloat(document.getElementById('cfgSpeed').value),
     max_domains: parseInt(document.getElementById('cfgMax').value, 10),
-    weekday_rotations_per_day: parseInt(document.getElementById('cfgWkday').value, 10),
-    weekend_rotations_per_day: parseInt(document.getElementById('cfgWkend').value, 10),
     word_list: document.getElementById('cfgWords').value
   });
   cfgLoaded = false;
@@ -702,11 +725,15 @@ async function refresh() {
   document.getElementById('nextAt').textContent = d.next_rotation_at;
 
   if (!cfgLoaded) {
-    document.getElementById('cfgMode').value = d.rotation_mode || 'weekly';
+    document.getElementById('cfgWeekly').checked = !!d.weekly_enabled;
+    document.getElementById('cfgDaily').checked = !!d.daily_enabled;
+    document.getElementById('cfgActiveHours').checked = !!d.active_hours_only;
+    document.getElementById('cfgNginxSync').checked = !!d.nginx_sync_enabled;
+    document.getElementById('cfgSshUser').value = d.nginx_ssh_user || 'root';
+    document.getElementById('cfgSshHost').value = d.nginx_ssh_host || '';
+    document.getElementById('cfgSshPort').value = d.nginx_ssh_port || 22;
     document.getElementById('cfgSpeed').value = d.speed_multiplier;
     document.getElementById('cfgMax').value = d.max_domains;
-    document.getElementById('cfgWkday').value = d.weekday_rotations_per_day;
-    document.getElementById('cfgWkend').value = d.weekend_rotations_per_day;
     document.getElementById('cfgWords').value = d.word_list.join(', ');
     cfgLoaded = true;
   }
@@ -924,7 +951,11 @@ async function refresh() {
   document.getElementById('targetIp').textContent = d.target_ip;
   document.getElementById('targetDomain').textContent = d.target_domain;
   document.getElementById('activeCount').textContent = `${d.active_count} / ${d.max_domains}`;
-  document.getElementById('modeText').textContent = `Mode: ${d.rotation_mode}`;
+  const modes = [];
+  if (d.weekly_enabled) modes.push('Weekly');
+  if (d.daily_enabled) modes.push('Daily');
+  if (d.active_hours_only) modes.push('Active Hours');
+  document.getElementById('modeText').textContent = modes.length ? modes.join(' + ') : 'Default';
   document.getElementById('workingCount').textContent = d.working_count;
   document.getElementById('oldCount').textContent = d.old_count;
   document.getElementById('nextIn').textContent = d.next_rotation_in;

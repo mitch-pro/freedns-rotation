@@ -4,9 +4,11 @@
   "dns_cookie": "",
   "target_domain": "mitch.pro",
   "max_domains": 55,
-  "rotation_mode": "weekly",
-  "weekday_rotations_per_day": 10,
-  "weekend_rotations_per_day": 5,
+  "weekly_enabled": true,
+  "daily_enabled": false,
+  "active_hours_only": false,
+  "active_hours_start": "08:30",
+  "active_hours_end": "15:20",
   "speed_multiplier": 1,
   "word_list": [
     "mitch",
@@ -29,12 +31,11 @@
   "web_port": 8080,
   "web_password": "changeme",
   "nginx_sync_enabled": false,
-  "nginx_sync_method": "local_sudo",
+  "nginx_ssh_user": "root",
+  "nginx_ssh_host": "",
+  "nginx_ssh_port": 22,
+  "nginx_ssh_key": "",
   "nginx_conf_path": "/etc/nginx/nginx.conf",
-  "nginx_proxy_pass": "http://127.0.0.1:8080",
-  "certbot_email": "",
-  "certbot_method": "nginx",
-  "certbot_webroot": "/var/www/html",
-  "nginx_ssh_target": "",
-  "nginx_ssh_key": ""
+  "nginx_locations_snippet": "/etc/nginx/snippets/mitch-main-locations.conf",
+  "certbot_email": ""
 }

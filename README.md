@@ -4,10 +4,10 @@ Automated FreeDNS (`freedns.afraid.org`) subdomain rotator with a password- and 
 
 ## Features
 - Maintains up to **55** active `A` record subdomains pointing to the current IP of `mitch.pro` (configurable).
-- Two rotation presets:
-  - **`weekly`** (default): 10 rotations/day on weekdays, 5/day on weekends (~1 week lifetime).
-  - **`2day`**: 28 rotations/day on weekdays, 27/day on weekends (~2 day lifetime).
-  - **`custom`**: custom weekday/weekend counts, plus `speed_multiplier` for fast testing.
+- Separate schedule toggles (can be combined):
+  - **`weekly_enabled`**: 10 rotations/day on weekdays, 5/day on weekends (~1 week lifetime).
+  - **`daily_enabled`**: 28 rotations/day on weekdays, 27/day on weekends (~2 day lifetime).
+  - **`active_hours_only`**: only rotates during local hours **08:30–15:20** on weekdays (no rotations on weekends).
 - Draws from **all public domains** in the FreeDNS registry (cached in `registry_cache.json`).
 - Picks subdomain prefixes randomly from `word_list` across public domains, falling back to 1- or 2-word diceware labels when exhausted.
 - Tracks:
@@ -42,21 +42,14 @@ systemctl --user enable --now freedns-rotation.service
 sudo loginctl enable-linger mitch
 ```
 
-## Secure Nginx + Certbot Sync (`sync_nginx.py`)
-`sync_nginx.py` only edits the `# BEGIN FREEDNS MANAGED DOMAINS` ... `# END FREEDNS MANAGED DOMAINS` section of `nginx.conf`, strictly validates every FQDN, backs up `nginx.conf` and rolls back automatically if `nginx -t` fails, issues Certbot certs only for verified working domains, and deletes certs only for domains it previously certified.
+## Secure Nginx + Certbot Sync (`sync_nginx.py`, SSH-Only)
+`sync_nginx.py` automatically syncs whenever a new working domain starts resolving (or is removed). It only edits `# --- BEGIN DOMAIN: <fqdn> ---` ... `# --- END DOMAIN: <fqdn> ---` blocks in `nginx.conf`, strictly validates every FQDN, backs up `nginx.conf` and rolls back automatically if `nginx -t` fails, runs `certbot --nginx certonly -d <fqdn>`, and deletes certs only for domains it previously managed.
 
-### Option A: Nginx on the same server (`"nginx_sync_method": "local_sudo"`)
-Add a single locked-down sudoers rule (`/etc/sudoers.d/freedns-nginx`):
-```sudoers
-mitch ALL=(root) NOPASSWD: /usr/bin/python3 /home/mitch/freedns/sync_nginx.py
-```
-
-### Option B: Nginx on a separate main server (`"nginx_sync_method": "ssh"`)
-1. Copy `sync_nginx.py` to `/opt/freedns/sync_nginx.py` on the main server.
+1. Copy `sync_nginx.py` to `/opt/freedns/sync_nginx.py` on your main server.
 2. Generate a dedicated SSH key (`ssh-keygen -t ed25519 -f ~/.ssh/freedns_sync_ed25519 -N ""`).
 3. Restrict the key on the main server's `/root/.ssh/authorized_keys` with a forced command:
    ```text
    command="/usr/bin/python3 /opt/freedns/sync_nginx.py --stdin",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA...
    ```
-4. Set `"nginx_sync_enabled": true`, `"nginx_sync_method": "ssh"`, `"nginx_ssh_target": "root@your-main-server"`, `"nginx_ssh_key": "/home/mitch/.ssh/freedns_sync_ed25519"`, `"nginx_proxy_pass"`, and `"certbot_email"` in `config.json`.
+4. Set `"nginx_sync_enabled": true`, `"nginx_ssh_user"`, `"nginx_ssh_host"`, `"nginx_ssh_port"`, `"nginx_ssh_key"`, and `"certbot_email"` in `config.json` (or via the Web UI).
 
