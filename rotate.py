@@ -23,6 +23,7 @@ from typing import Any
 
 from diceware import generate_diceware_label
 from freedns_client import (
+    AuthenticationError,
     BaseFreeDNSClient,
     CaptchaRequiredError,
     FreeDNSClient,
@@ -133,7 +134,22 @@ def compute_replacement_times(
     return schedule
 
 
+def _load_dotenv(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+
 def load_config(path: Path) -> dict[str, Any]:
+    _load_dotenv(path.parent / ".env")
     with path.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
     # Allow environment variable overrides for credentials.
@@ -292,9 +308,32 @@ def build_client(config: dict[str, Any]) -> FreeDNSClient:
     client = FreeDNSClient()
     if config.get("dns_cookie"):
         client.set_cookie(config["dns_cookie"])
-    else:
-        client.login(config.get("username", ""), config.get("password", ""))
+        return client
+
+    cookie_cache = Path(__file__).resolve().parent / ".freedns_cookie"
+    if cookie_cache.exists():
+        cached = cookie_cache.read_text(encoding="utf-8").strip()
+        if cached:
+            client.set_cookie(cached)
+            try:
+                client.list_subdomains()
+                return client
+            except Exception:
+                client = FreeDNSClient()
+
+    client.login(config.get("username", ""), config.get("password", ""))
+    cookie_val = client.session.cookies.get("dns_cookie")
+    if cookie_val:
+        cookie_cache.write_text(cookie_val, encoding="utf-8")
     return client
+
+
+def reauth_client(config: dict[str, Any]) -> FreeDNSClient:
+    """Clear cached cookie and re-login when the session expires."""
+    cookie_cache = Path(__file__).resolve().parent / ".freedns_cookie"
+    if cookie_cache.exists():
+        cookie_cache.unlink()
+    return build_client(config)
 
 
 def sync_state_with_account(client: BaseFreeDNSClient, state: dict[str, Any]) -> None:
@@ -531,6 +570,44 @@ def clear_all_domains(
     return deleted_count
 
 
+def import_account_domains(
+    client: BaseFreeDNSClient,
+    state: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[int, int]:
+    """Scrape all subdomains from the FreeDNS account and add missing ones to state."""
+    remote_records = client.list_subdomains()
+    existing_ids = {str(d["data_id"]) for d in state["active_domains"]}
+    existing_fqdns = {d["fqdn"].lower() for d in state["active_domains"]}
+    now_iso = utc_now().isoformat()
+
+    added = 0
+    for rec in remote_records:
+        if rec.data_id in existing_ids or rec.fqdn.lower() in existing_fqdns:
+            continue
+        state["active_domains"].append(
+            {
+                "data_id": rec.data_id,
+                "subdomain": rec.subdomain,
+                "domain": rec.domain,
+                "fqdn": rec.fqdn,
+                "record_type": rec.record_type,
+                "address": rec.address,
+                "created_at": now_iso,
+                "source": "imported",
+            }
+        )
+        existing_ids.add(rec.data_id)
+        existing_fqdns.add(rec.fqdn.lower())
+        added += 1
+        print(f"[imported] {rec.fqdn} -> {rec.address} (id={rec.data_id})")
+
+    state["active_domains"].sort(key=lambda d: d["created_at"])
+    target_ip = resolve_target_ip(config["target_domain"])
+    refresh_working_domains(state, target_ip, config)
+    return added, len(remote_records)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="FreeDNS subdomain rotation script")
     parser.add_argument("--config", default="config.json", help="Path to config.json")
@@ -545,6 +622,7 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="Run one rotation step and exit")
     parser.add_argument("--bootstrap", type=int, default=0, help="Create N subdomains immediately before rotating")
     parser.add_argument("--status", action="store_true", help="Refresh/show active & working domain lists and exit")
+    parser.add_argument("--import-account", action="store_true", help="Scrape all domains from FreeDNS account and add them")
     parser.add_argument("--clear-all", action="store_true", help="Delete ALL subdomains from FreeDNS and exit")
     args = parser.parse_args()
 
@@ -591,6 +669,13 @@ def main() -> int:
         print(f"[clear-all] Deleted {deleted} subdomain(s) from FreeDNS.")
         return 0
 
+    if args.import_account:
+        target_ip = resolve_target_ip(config["target_domain"])
+        added, total = import_account_domains(client, state, config)
+        persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
+        print(f"[import] Added {added} new domain(s) ({total} total on FreeDNS account).")
+        return 0
+
     registry_domains = choose_parent_domains(client, config)
 
     running = True
@@ -623,7 +708,12 @@ def main() -> int:
         )
         while running:
             now = utc_now()
-            target_ip = rotate_once(client, state, config, registry_domains)
+            try:
+                target_ip = rotate_once(client, state, config, registry_domains)
+            except AuthenticationError:
+                print("[auth] Session cookie expired, re-logging in...")
+                client = reauth_client(config)
+                target_ip = rotate_once(client, state, config, registry_domains)
             interval = get_interval_seconds(now, config)
             next_rot = now + timedelta(seconds=interval)
             state["next_rotation_at"] = next_rot.isoformat()

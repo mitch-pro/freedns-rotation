@@ -18,7 +18,7 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
-from freedns_client import FreeDNSClient
+from freedns_client import AuthenticationError, FreeDNSClient
 from rotate import (
     apply_rotation_mode,
     build_client,
@@ -27,10 +27,12 @@ from rotate import (
     compute_replacement_times,
     format_duration,
     get_interval_seconds,
+    import_account_domains,
     load_config,
     load_state,
     parse_iso,
     persist_all_files,
+    reauth_client,
     refresh_working_domains,
     resolve_target_ip,
     rotate_once,
@@ -39,9 +41,8 @@ from rotate import (
 
 
 class AuthManager:
-    """Self-hosted open-source SVG CAPTCHA and session cookie manager."""
+    """Self-hosted open-source warped SVG CAPTCHA and session cookie manager."""
 
-    # Avoid ambiguous characters (0/O, 1/I/l).
     ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     COLORS = ("#93c5fd", "#6ee7b7", "#fcd34d", "#f9a8d4", "#c4b5fd")
 
@@ -65,38 +66,58 @@ class AuthManager:
 
     def _render_svg(self, code: str) -> str:
         rng = secrets.SystemRandom()
+        seed = rng.randint(1, 99999)
+        freq_x = rng.uniform(0.025, 0.045)
+        freq_y = rng.uniform(0.05, 0.08)
+        scale = rng.uniform(5.5, 8.5)
+
         parts = [
-            '<svg xmlns="http://www.w3.org/2000/svg" width="220" height="72" viewBox="0 0 220 72">',
-            '<rect width="220" height="72" rx="8" fill="#0b0f17" stroke="#232d42"/>',
+            '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="80" viewBox="0 0 240 80">',
+            "<defs>",
+            f'<filter id="warp_{seed}" x="-10%" y="-10%" width="120%" height="120%">',
+            f'<feTurbulence type="fractalNoise" baseFrequency="{freq_x:.3f} {freq_y:.3f}" '
+            f'numOctaves="2" seed="{seed}" result="noise"/>',
+            f'<feDisplacementMap in="SourceGraphic" in2="noise" scale="{scale:.1f}" '
+            'xChannelSelector="R" yChannelSelector="G"/>',
+            "</filter>",
+            "</defs>",
+            '<rect width="240" height="80" rx="8" fill="#0b0f17" stroke="#232d42"/>',
+            f'<g filter="url(#warp_{seed})">',
         ]
-        # Distortion curves
-        for _ in range(5):
-            x1, y1 = rng.randint(0, 40), rng.randint(5, 67)
-            cx, cy = rng.randint(60, 160), rng.randint(0, 72)
-            x2, y2 = rng.randint(180, 220), rng.randint(5, 67)
+
+        # Background interference curves
+        for _ in range(6):
+            x1, y1 = rng.randint(0, 50), rng.randint(8, 72)
+            cx, cy = rng.randint(60, 180), rng.randint(0, 80)
+            x2, y2 = rng.randint(190, 240), rng.randint(8, 72)
             col = rng.choice(self.COLORS)
             parts.append(
                 f'<path d="M{x1},{y1} Q{cx},{cy} {x2},{y2}" '
-                f'stroke="{col}" stroke-opacity="0.35" stroke-width="1.6" fill="none"/>'
+                f'stroke="{col}" stroke-opacity="0.4" stroke-width="1.8" fill="none"/>'
             )
-        # Noise dots
-        for _ in range(32):
-            dx, dy = rng.randint(4, 216), rng.randint(4, 68)
-            r = rng.uniform(0.8, 1.8)
-            parts.append(f'<circle cx="{dx}" cy="{dy}" r="{r:.1f}" fill="#64748b" opacity="0.45"/>')
 
-        # Distorted characters
+        # Warped, skewed, rotated characters
         for idx, ch in enumerate(code):
-            x = 22 + idx * 38 + rng.randint(-4, 4)
-            y = 46 + rng.randint(-6, 6)
-            rot = rng.randint(-22, 22)
+            x = 24 + idx * 41 + rng.randint(-4, 4)
+            y = 52 + rng.randint(-6, 6)
+            rot = rng.randint(-25, 25)
+            skew = rng.randint(-18, 18)
+            fsize = rng.randint(30, 36)
             col = rng.choice(self.COLORS)
             parts.append(
-                f'<text x="{x}" y="{y}" fill="{col}" font-family="monospace" '
-                f'font-size="30" font-weight="bold" '
-                f'transform="rotate({rot} {x} {y})">{ch}</text>'
+                f'<text x="{x}" y="{y}" fill="{col}" '
+                f'font-family="Georgia, \'Times New Roman\', serif" '
+                f'font-size="{fsize}" font-weight="900" '
+                f'transform="rotate({rot} {x} {y}) skewX({skew})">{ch}</text>'
             )
-        parts.append("</svg>")
+
+        # Noise speckles
+        for _ in range(40):
+            dx, dy = rng.randint(6, 234), rng.randint(6, 74)
+            r = rng.uniform(0.9, 2.0)
+            parts.append(f'<circle cx="{dx}" cy="{dy}" r="{r:.1f}" fill="#94a3b8" opacity="0.4"/>')
+
+        parts.append("</g></svg>")
         return "".join(parts)
 
     def login(self, password: str, captcha_id: str, captcha_answer: str) -> tuple[bool, str, str | None]:
@@ -255,7 +276,12 @@ class RotatorController:
         with self.lock:
             client = self._ensure_client()
             now = utc_now()
-            target_ip = rotate_once(client, self.state, self.config, self._registry)
+            try:
+                target_ip = rotate_once(client, self.state, self.config, self._registry)
+            except AuthenticationError:
+                self.log("Session cookie expired; re-logging in...")
+                self._client = reauth_client(self.config)
+                target_ip = rotate_once(self._client, self.state, self.config, self._registry)
             interval = get_interval_seconds(now, self.config)
             self.next_rot = now + timedelta(seconds=interval)
             self.state["next_rotation_at"] = self.next_rot.isoformat()
@@ -280,11 +306,31 @@ class RotatorController:
             self.running = False
             client = self._ensure_client()
             target_ip = resolve_target_ip(self.config["target_domain"])
-            deleted = clear_all_domains(client, self.state, self.config)
+            try:
+                deleted = clear_all_domains(client, self.state, self.config)
+            except AuthenticationError:
+                self.log("Session cookie expired; re-logging in...")
+                self._client = reauth_client(self.config)
+                deleted = clear_all_domains(self._client, self.state, self.config)
             self._persist(target_ip)
             self._last_error = None
             self.log(f"Cleared ALL domains from FreeDNS ({deleted} deleted).")
             return deleted
+
+    def import_account(self) -> tuple[int, int]:
+        with self.lock:
+            client = self._ensure_client()
+            target_ip = resolve_target_ip(self.config["target_domain"])
+            try:
+                added, total = import_account_domains(client, self.state, self.config)
+            except AuthenticationError:
+                self.log("Session cookie expired; re-logging in...")
+                self._client = reauth_client(self.config)
+                added, total = import_account_domains(self._client, self.state, self.config)
+            self._persist(target_ip)
+            self._last_error = None
+            self.log(f"Imported {added} new domain(s) from FreeDNS ({total} total on account).")
+            return added, total
 
     def update_config(self, updates: dict[str, Any]) -> None:
         with self.lock:
@@ -468,6 +514,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="green" onclick="api('/api/start')">Start Rotation</button>
     <button onclick="api('/api/pause')">Pause</button>
     <button class="primary" onclick="api('/api/rotate-now')">Rotate Now</button>
+    <button onclick="api('/api/import-account')">Import Account Domains</button>
     <button onclick="api('/api/refresh-dns')">Check Working DNS</button>
     <button class="danger" onclick="clearAll()">Clear ALL Domains</button>
   </div>
@@ -815,6 +862,9 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
                 elif path == "/api/clear-all":
                     deleted = controller.clear_all()
                     self._send_json(HTTPStatus.OK, {"ok": True, "deleted": deleted})
+                elif path == "/api/import-account":
+                    added, total = controller.import_account()
+                    self._send_json(HTTPStatus.OK, {"ok": True, "added": added, "total": total})
                 elif path == "/api/config":
                     controller.update_config(body)
                     self._send_json(HTTPStatus.OK, {"ok": True})

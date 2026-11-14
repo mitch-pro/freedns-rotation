@@ -94,14 +94,20 @@ class FreeDNSClient:
         )
         resp.raise_for_status()
         text_lower = resp.text.lower()
-        if "logout" not in text_lower and "dns_cookie" not in self.session.cookies:
-            raise AuthenticationError("Login to FreeDNS failed; check username/password.")
+        if (
+            "invalid userid/pass" in text_lower
+            or "dns_cookie" not in self.session.cookies
+        ):
+            raise AuthenticationError(
+                "Login to FreeDNS failed (Invalid UserID/Pass or missing dns_cookie). "
+                "Check username/password or set dns_cookie in config.json / .env."
+            )
 
     def list_subdomains(self) -> list[SubdomainRecord]:
         resp = self.session.get(f"{BASE_URL}/subdomain/", timeout=self.timeout)
         resp.raise_for_status()
-        if "action=auth" in resp.text and "logout" not in resp.text.lower():
-            raise AuthenticationError("Session is not authenticated with FreeDNS.")
+        if "zc.php" in resp.url or "action=auth" in resp.text:
+            raise AuthenticationError("Session is not authenticated with FreeDNS (redirected to login).")
 
         records: list[SubdomainRecord] = []
         # Each subdomain row links to edit.php?data_id=<id> with the FQDN as link text,
@@ -191,6 +197,8 @@ class FreeDNSClient:
         edit_url = f"{BASE_URL}/subdomain/edit.php?edit_domain_id={domain_id}"
         edit_resp = self.session.get(edit_url, timeout=self.timeout)
         edit_resp.raise_for_status()
+        if "zc.php" in edit_resp.url or "action=auth" in edit_resp.text:
+            raise AuthenticationError("Session expired (redirected to login).")
 
         if self._has_captcha(edit_resp.text):
             raise CaptchaRequiredError(
@@ -259,6 +267,8 @@ class FreeDNSClient:
             allow_redirects=True,
         )
         resp.raise_for_status()
+        if "zc.php" in resp.url or "action=auth" in resp.text:
+            raise AuthenticationError("Session expired (redirected to login).")
 
     @staticmethod
     def _has_captcha(page_html: str) -> bool:

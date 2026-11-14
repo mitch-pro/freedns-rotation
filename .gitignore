@@ -1,4 +1,5 @@
 .env
+.freedns_cookie
 __pycache__/
 *.pyc
 config.json
