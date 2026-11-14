@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -16,7 +17,7 @@ import secrets
 import threading
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from freedns_client import AuthenticationError, FreeDNSClient
 from rotate import (
@@ -34,6 +35,7 @@ from rotate import (
     persist_all_files,
     reauth_client,
     refresh_working_domains,
+    resolve_fqdn_ips,
     resolve_target_ip,
     rotate_once,
     trigger_nginx_sync,
@@ -194,6 +196,8 @@ class RotatorController:
         self._client: FreeDNSClient | None = None
         self._registry = None
         self._last_error: str | None = None
+        self._cached_target_ip: str = "unresolved"
+        self._cached_target_ip_at: float = 0.0
 
         now = utc_now()
         self.next_rot = (
@@ -296,8 +300,41 @@ class RotatorController:
 
     def refresh_dns(self) -> None:
         with self.lock:
-            target_ip = resolve_target_ip(self.config["target_domain"])
-            refresh_working_domains(self.state, target_ip, self.config)
+            target_domain = self.config["target_domain"]
+            snapshot = [
+                (d["fqdn"], d.get("address") or "")
+                for d in self.state["active_domains"]
+            ]
+
+        target_ip = resolve_target_ip(target_domain)
+        results: dict[str, tuple[str, bool]] = {}
+        if snapshot:
+            def _check(item: tuple[str, str]) -> tuple[str, str, bool]:
+                fqdn, addr = item
+                expected = addr or target_ip
+                return fqdn, expected, (expected in resolve_fqdn_ips(fqdn))
+
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                for fqdn, expected, ok in pool.map(_check, snapshot):
+                    results[fqdn] = (expected, ok)
+
+        now = utc_now()
+        with self.lock:
+            self._cached_target_ip = target_ip
+            self._cached_target_ip_at = time.monotonic()
+            for entry in self.state["active_domains"]:
+                res = results.get(entry["fqdn"])
+                if not res:
+                    continue
+                expected, ok = res
+                if ok:
+                    if not entry.get("working"):
+                        entry["working"] = True
+                        entry["verified_at"] = now.isoformat()
+                        entry["resolved_ip"] = expected
+                        self.log(f"{entry['fqdn']} now resolves to {expected}")
+                else:
+                    entry["working"] = False
             self._persist(target_ip)
             working_cnt = sum(1 for d in self.state["active_domains"] if d.get("working"))
             self.log(f"DNS check complete: {working_cnt}/{len(self.state['active_domains'])} working.")
@@ -377,10 +414,14 @@ class RotatorController:
     def get_status(self) -> dict[str, Any]:
         with self.lock:
             now = utc_now()
-            try:
-                target_ip = resolve_target_ip(self.config["target_domain"])
-            except Exception:
-                target_ip = "unresolved"
+            now_mono = time.monotonic()
+            if (now_mono - self._cached_target_ip_at) >= 60.0 or self._cached_target_ip == "unresolved":
+                try:
+                    self._cached_target_ip = resolve_target_ip(self.config["target_domain"])
+                    self._cached_target_ip_at = now_mono
+                except Exception:
+                    pass
+            target_ip = self._cached_target_ip
 
             active = sorted(self.state["active_domains"], key=lambda d: d["created_at"])
             replacements = compute_replacement_times(active, self.next_rot, self.config)
@@ -441,6 +482,25 @@ class RotatorController:
                 "old_domains": old_rows,
                 "logs": list(self.logs),
             }
+
+    def get_public_status(self) -> dict[str, Any]:
+        """Read-only public status of all domains (no logs, secrets, or controls)."""
+        full = self.get_status()
+        return {
+            "running": full["running"],
+            "target_domain": full["target_domain"],
+            "target_ip": full["target_ip"],
+            "max_domains": full["max_domains"],
+            "rotation_mode": full["rotation_mode"],
+            "next_rotation_at": full["next_rotation_at"],
+            "next_rotation_in": full["next_rotation_in"],
+            "active_count": full["active_count"],
+            "working_count": full["working_count"],
+            "old_count": full["old_count"],
+            "working_domains": full["working_domains"],
+            "active_domains": full["active_domains"],
+            "old_domains": full["old_domains"],
+        }
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -777,6 +837,130 @@ loadCaptcha();
 """
 
 
+STATUS_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeDNS Domain Status</title>
+<style>
+  :root {
+    --bg: #0b0f17; --card: #131a26; --border: #232d42;
+    --text: #e6edf7; --muted: #8b9bb4; --accent: #3b82f6;
+    --green: #10b981; --amber: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 24px; }
+  .wrap { max-width: 1150px; margin: 0 auto; }
+  header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+  h1 { margin: 0; font-size: 22px; }
+  .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.run { background: rgba(16,185,129,.15); color: var(--green); border: 1px solid rgba(16,185,129,.4); }
+  .badge.pause { background: rgba(245,158,11,.15); color: var(--amber); border: 1px solid rgba(245,158,11,.4); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .val { font-size: 20px; font-weight: 700; }
+  .sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  button { border: 1px solid var(--border); background: var(--card); color: var(--text); padding: 9px 15px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; background: rgba(255,255,255,.02); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>FreeDNS Domain Status</h1>
+    <div style="display:flex;gap:10px;align-items:center;">
+      <span id="statusBadge" class="badge pause">PAUSED</span>
+      <a href="/" style="color:#93c5fd;font-size:13px;text-decoration:none;">Admin</a>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card"><div class="label">Target A Record</div><div class="val mono" id="targetIp">-</div><div class="sub" id="targetDomain">-</div></div>
+    <div class="card"><div class="label">Active Domains</div><div class="val" id="activeCount">0 / 55</div><div class="sub" id="modeText">-</div></div>
+    <div class="card"><div class="label">Verified Working</div><div class="val" id="workingCount">0</div><div class="sub">DNS resolves properly</div></div>
+    <div class="card"><div class="label">Retired Domains</div><div class="val" id="oldCount">0</div><div class="sub">Never reused</div></div>
+    <div class="card"><div class="label">Next Rotation</div><div class="val" id="nextIn">-</div><div class="sub" id="nextAt">-</div></div>
+  </div>
+
+  <div class="tabs">
+    <button class="active" onclick="showTab('working', this)">Working Domains</button>
+    <button onclick="showTab('active', this)">All Active Domains</button>
+    <button onclick="showTab('old', this)">Old / Retired</button>
+  </div>
+
+  <div class="panel" id="tab-working"></div>
+  <div class="panel" id="tab-active" style="display:none"></div>
+  <div class="panel" id="tab-old" style="display:none"></div>
+</div>
+<script>
+function showTab(name, btn) {
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  ['working','active','old'].forEach(t => {
+    document.getElementById('tab-' + t).style.display = (t === name) ? 'block' : 'none';
+  });
+}
+function renderTable(cols, rows) {
+  if (!rows.length) return '<div style="padding:18px;color:#8b9bb4">No domains yet.</div>';
+  let h = '<table><thead><tr>' + cols.map(c => `<th>${c.label}</th>`).join('') + '</tr></thead><tbody>';
+  for (const r of rows) {
+    h += '<tr>' + cols.map(c => `<td class="${c.mono ? 'mono' : ''}">${r[c.key] ?? ''}</td>`).join('') + '</tr>';
+  }
+  return h + '</tbody></table>';
+}
+async function refresh() {
+  const d = await (await fetch('/api/public-status')).json();
+  const badge = document.getElementById('statusBadge');
+  badge.textContent = d.running ? 'RUNNING' : 'PAUSED';
+  badge.className = 'badge ' + (d.running ? 'run' : 'pause');
+  document.getElementById('targetIp').textContent = d.target_ip;
+  document.getElementById('targetDomain').textContent = d.target_domain;
+  document.getElementById('activeCount').textContent = `${d.active_count} / ${d.max_domains}`;
+  document.getElementById('modeText').textContent = `Mode: ${d.rotation_mode}`;
+  document.getElementById('workingCount').textContent = d.working_count;
+  document.getElementById('oldCount').textContent = d.old_count;
+  document.getElementById('nextIn').textContent = d.next_rotation_in;
+  document.getElementById('nextAt').textContent = d.next_rotation_at;
+
+  document.getElementById('tab-working').innerHTML = renderTable([
+    {key:'fqdn', label:'FQDN', mono:true},
+    {key:'address', label:'Resolved IP', mono:true},
+    {key:'verified_at', label:'Verified Working'},
+    {key:'replace_at', label:'Replace At'},
+    {key:'replace_in', label:'Replace In'}
+  ], d.working_domains);
+
+  document.getElementById('tab-active').innerHTML = renderTable([
+    {key:'fqdn', label:'FQDN', mono:true},
+    {key:'address', label:'Target IP', mono:true},
+    {key:'working', label:'DNS OK'},
+    {key:'created_at', label:'Created At'},
+    {key:'replace_at', label:'Replace At'},
+    {key:'replace_in', label:'Replace In'}
+  ], d.active_domains);
+
+  document.getElementById('tab-old').innerHTML = renderTable([
+    {key:'fqdn', label:'FQDN', mono:true},
+    {key:'address', label:'Former IP', mono:true},
+    {key:'retired_at', label:'Retired At'}
+  ], d.old_domains);
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
+
+
 def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _send_json(self, code: int, payload: Any, extra_headers: dict[str, str] | None = None) -> None:
@@ -794,7 +978,9 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
             return auth.is_authenticated(self.headers.get("Cookie"))
 
         def do_GET(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
             if path == "/":
                 page = HTML_PAGE if self._is_authed() else LOGIN_PAGE
                 body = page.encode("utf-8")
@@ -803,6 +989,18 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/status":
+                if query.get("format") == ["json"]:
+                    self._send_json(HTTPStatus.OK, controller.get_public_status())
+                    return
+                body = STATUS_PAGE.encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/api/public-status":
+                self._send_json(HTTPStatus.OK, controller.get_public_status())
             elif path == "/api/captcha":
                 captcha_id, svg = auth.generate_captcha()
                 self._send_json(HTTPStatus.OK, {"captcha_id": captcha_id, "svg": svg})
