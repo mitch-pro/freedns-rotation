@@ -20,8 +20,10 @@ import sys
 from typing import Any
 
 
-BEGIN_MARKER = "# BEGIN FREEDNS MANAGED DOMAINS"
-END_MARKER = "# END FREEDNS MANAGED DOMAINS"
+DOMAIN_BLOCK_RE = re.compile(
+    r"\n?# --- BEGIN DOMAIN: ([^\s]+) ---\n.*?# --- END DOMAIN: \1 ---\n?",
+    re.S,
+)
 FQDN_RE = re.compile(
     r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
@@ -47,7 +49,7 @@ def cert_exists(fqdn: str, letsencrypt_dir: Path) -> bool:
 
 def render_server_blocks(
     fqdns: list[str],
-    proxy_pass: str,
+    locations_snippet: str,
     letsencrypt_dir: Path,
 ) -> str:
     blocks: list[str] = []
@@ -56,64 +58,46 @@ def render_server_blocks(
             fullchain = letsencrypt_dir / "live" / fqdn / "fullchain.pem"
             privkey = letsencrypt_dir / "live" / fqdn / "privkey.pem"
             blocks.append(
+                f"# --- BEGIN DOMAIN: {fqdn} ---\n"
                 f"server {{\n"
                 f"    listen 80;\n"
+                f"    listen [::]:80;\n"
                 f"    server_name {fqdn};\n"
                 f"    return 301 https://$host$request_uri;\n"
-                f"}}\n"
+                f"}}\n\n"
                 f"server {{\n"
                 f"    listen 443 ssl;\n"
-                f"    server_name {fqdn};\n"
+                f"    server_name {fqdn};\n\n"
                 f"    ssl_certificate {fullchain};\n"
                 f"    ssl_certificate_key {privkey};\n"
-                f"    location / {{\n"
-                f"        proxy_pass {proxy_pass};\n"
-                f"        proxy_set_header Host $host;\n"
-                f"        proxy_set_header X-Real-IP $remote_addr;\n"
-                f"        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-                f"        proxy_set_header X-Forwarded-Proto $scheme;\n"
-                f"    }}\n"
-                f"}}"
+                f"    include {letsencrypt_dir}/options-ssl-nginx.conf;\n"
+                f"    ssl_dhparam {letsencrypt_dir}/ssl-dhparams.pem;\n\n"
+                f"    include {locations_snippet};\n"
+                f"}}\n"
+                f"# --- END DOMAIN: {fqdn} ---"
             )
         else:
             blocks.append(
+                f"# --- BEGIN DOMAIN: {fqdn} ---\n"
                 f"server {{\n"
                 f"    listen 80;\n"
-                f"    server_name {fqdn};\n"
-                f"    location / {{\n"
-                f"        proxy_pass {proxy_pass};\n"
-                f"        proxy_set_header Host $host;\n"
-                f"        proxy_set_header X-Real-IP $remote_addr;\n"
-                f"        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
-                f"        proxy_set_header X-Forwarded-Proto $scheme;\n"
-                f"    }}\n"
-                f"}}"
+                f"    listen [::]:80;\n"
+                f"    server_name {fqdn};\n\n"
+                f"    include {locations_snippet};\n"
+                f"}}\n"
+                f"# --- END DOMAIN: {fqdn} ---"
             )
-    return "\n\n".join(blocks)
+    return "\n\n\n".join(blocks)
 
 
-def update_nginx_conf(nginx_conf: Path, managed_body: str) -> None:
+def update_nginx_conf(nginx_conf: Path, managed_body: str) -> list[str]:
+    """Strip all old # --- BEGIN DOMAIN: ... --- blocks and append current ones.
+    Returns list of domain names that were previously in nginx.conf.
+    """
     content = nginx_conf.read_text(encoding="utf-8")
-    section = f"{BEGIN_MARKER}\n{managed_body}\n{END_MARKER}" if managed_body else f"{BEGIN_MARKER}\n{END_MARKER}"
-
-    pattern = re.compile(
-        re.escape(BEGIN_MARKER) + r".*?" + re.escape(END_MARKER),
-        re.S,
-    )
-    if pattern.search(content):
-        new_content = pattern.sub(lambda _m: section, content, count=1)
-    else:
-        # Insert before the last closing brace of http { ... } if present.
-        last_brace = content.rfind("}")
-        if last_brace != -1 and re.search(r"\bhttp\s*\{", content):
-            new_content = (
-                content[:last_brace].rstrip()
-                + "\n\n    "
-                + section.replace("\n", "\n    ")
-                + "\n}\n"
-            )
-        else:
-            new_content = content.rstrip() + "\n\n" + section + "\n"
+    existing_domains = [m.group(1).strip().lower() for m in DOMAIN_BLOCK_RE.finditer(content)]
+    stripped = DOMAIN_BLOCK_RE.sub("\n", content).rstrip()
+    new_content = stripped + ("\n\n\n" + managed_body + "\n" if managed_body else "\n")
 
     backup = nginx_conf.with_suffix(".conf.freedns.bak")
     shutil.copy2(nginx_conf, backup)
@@ -123,6 +107,7 @@ def update_nginx_conf(nginx_conf: Path, managed_body: str) -> None:
     except Exception:
         shutil.copy2(backup, nginx_conf)
         raise
+    return existing_domains
 
 
 def reload_nginx() -> None:
@@ -177,7 +162,9 @@ def sync(
 ) -> None:
     fqdns = sorted({validate_fqdn(d) for d in working_fqdns})
     nginx_conf = Path(config.get("nginx_conf_path", "/etc/nginx/nginx.conf"))
-    proxy_pass = str(config.get("nginx_proxy_pass", "http://127.0.0.1:8080"))
+    locations_snippet = str(
+        config.get("nginx_locations_snippet", "/etc/nginx/snippets/mitch-main-locations.conf")
+    )
     letsencrypt_dir = Path(config.get("letsencrypt_dir", "/etc/letsencrypt"))
     certbot_email = str(config.get("certbot_email", "")).strip()
     certbot_method = str(config.get("certbot_method", "nginx")).strip()
@@ -197,8 +184,11 @@ def sync(
             previously_managed = set()
 
     # 1. Write initial HTTP blocks for any new domains so Certbot HTTP-01 can verify them.
-    initial_blocks = render_server_blocks(fqdns, proxy_pass, letsencrypt_dir)
-    update_nginx_conf(nginx_conf, initial_blocks)
+    initial_blocks = render_server_blocks(fqdns, locations_snippet, letsencrypt_dir)
+    previous_in_conf = update_nginx_conf(nginx_conf, initial_blocks)
+    for d in previous_in_conf:
+        if FQDN_RE.match(d):
+            previously_managed.add(d)
     reload_nginx()
 
     # 2. Obtain Certbot certs for any working domain missing one.
@@ -225,7 +215,7 @@ def sync(
 
     # 4. Re-render nginx.conf with HTTPS blocks if new certs were issued.
     if newly_certified:
-        final_blocks = render_server_blocks(fqdns, proxy_pass, letsencrypt_dir)
+        final_blocks = render_server_blocks(fqdns, locations_snippet, letsencrypt_dir)
         update_nginx_conf(nginx_conf, final_blocks)
         reload_nginx()
 
