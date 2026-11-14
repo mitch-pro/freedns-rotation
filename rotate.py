@@ -17,6 +17,7 @@ from pathlib import Path
 import secrets
 import signal
 import socket
+import subprocess
 import sys
 import time
 from typing import Any
@@ -513,6 +514,54 @@ def rotate_once(
     return target_ip
 
 
+def trigger_nginx_sync(
+    state: dict[str, Any],
+    config: dict[str, Any],
+    base_dir: Path,
+    force: bool = False,
+) -> bool:
+    """Sync verified working domains to nginx + certbot if enabled and changed."""
+    if not force and not config.get("nginx_sync_enabled", False):
+        return False
+
+    working_fqdns = sorted(
+        d["fqdn"].lower() for d in state.get("active_domains", []) if d.get("working")
+    )
+    if not force and working_fqdns == state.get("last_synced_working", []):
+        return False
+
+    method = str(config.get("nginx_sync_method", "local_sudo")).strip()
+    if method == "ssh":
+        target = str(config.get("nginx_ssh_target", "")).strip()
+        if not target:
+            raise RuntimeError("nginx_ssh_target is required when nginx_sync_method is 'ssh'")
+        cmd = ["ssh", "-o", "BatchMode=yes"]
+        ssh_key = str(config.get("nginx_ssh_key", "")).strip()
+        if ssh_key:
+            cmd.extend(["-i", ssh_key])
+        cmd.append(target)
+        res = subprocess.run(
+            cmd,
+            input=json.dumps({"working_fqdns": working_fqdns}),
+            capture_output=True,
+            text=True,
+        )
+    else:
+        script_path = base_dir / "sync_nginx.py"
+        res = subprocess.run(
+            ["sudo", "-n", sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+        )
+
+    if res.returncode != 0:
+        raise RuntimeError(f"nginx sync failed: {res.stderr.strip() or res.stdout.strip()}")
+    if res.stdout.strip():
+        print(res.stdout.strip())
+    state["last_synced_working"] = working_fqdns
+    return True
+
+
 def persist_all_files(
     state_path: Path,
     active_path: Path,
@@ -523,6 +572,11 @@ def persist_all_files(
     target_ip: str,
     config: dict[str, Any],
 ) -> None:
+    if config.get("nginx_sync_enabled", False):
+        try:
+            trigger_nginx_sync(state, config, state_path.parent)
+        except Exception as exc:
+            print(f"[nginx-sync] error: {exc}", file=sys.stderr)
     save_state(state_path, state)
     write_active_domains_file(active_path, state, next_rot, target_ip, config)
     write_working_domains_file(working_path, state, next_rot, target_ip, config)

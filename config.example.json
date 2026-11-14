@@ -27,5 +27,14 @@
   "state_file": "state.json",
   "web_host": "127.0.0.1",
   "web_port": 8080,
-  "web_password": "changeme"
+  "web_password": "changeme",
+  "nginx_sync_enabled": false,
+  "nginx_sync_method": "local_sudo",
+  "nginx_conf_path": "/etc/nginx/nginx.conf",
+  "nginx_proxy_pass": "http://127.0.0.1:8080",
+  "certbot_email": "",
+  "certbot_method": "nginx",
+  "certbot_webroot": "/var/www/html",
+  "nginx_ssh_target": "",
+  "nginx_ssh_key": ""
 }

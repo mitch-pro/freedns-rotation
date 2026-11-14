@@ -6,6 +6,8 @@ config.json
 state.json
 state.tmp
 registry_cache.json
+managed_certs.json
 active_domains.txt
 working_domains.txt
 old_domains.txt
+*.bak

@@ -36,6 +36,7 @@ from rotate import (
     refresh_working_domains,
     resolve_target_ip,
     rotate_once,
+    trigger_nginx_sync,
     utc_now,
 )
 
@@ -332,6 +333,13 @@ class RotatorController:
             self.log(f"Imported {added} new domain(s) from FreeDNS ({total} total on account).")
             return added, total
 
+    def sync_nginx(self) -> None:
+        with self.lock:
+            trigger_nginx_sync(self.state, self.config, self.base_dir, force=True)
+            target_ip = resolve_target_ip(self.config["target_domain"])
+            self._persist(target_ip)
+            self.log("Synced working domains to Nginx & Certbot.")
+
     def update_config(self, updates: dict[str, Any]) -> None:
         with self.lock:
             if "rotation_mode" in updates:
@@ -516,6 +524,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="primary" onclick="api('/api/rotate-now')">Rotate Now</button>
     <button onclick="api('/api/import-account')">Import Account Domains</button>
     <button onclick="api('/api/refresh-dns')">Check Working DNS</button>
+    <button onclick="api('/api/sync-nginx')">Sync Nginx &amp; Certbot</button>
     <button class="danger" onclick="clearAll()">Clear ALL Domains</button>
   </div>
 
@@ -865,6 +874,9 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
                 elif path == "/api/import-account":
                     added, total = controller.import_account()
                     self._send_json(HTTPStatus.OK, {"ok": True, "added": added, "total": total})
+                elif path == "/api/sync-nginx":
+                    controller.sync_nginx()
+                    self._send_json(HTTPStatus.OK, {"ok": True})
                 elif path == "/api/config":
                     controller.update_config(body)
                     self._send_json(HTTPStatus.OK, {"ok": True})
