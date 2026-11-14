@@ -3,10 +3,11 @@
 Automated FreeDNS (`freedns.afraid.org`) subdomain rotator with a password- and CAPTCHA-protected Web UI.
 
 ## Features
-- Maintains up to **55** active `A` record subdomains pointing to the current IP of `mitch.pro` (configurable).
+- Maintains up to **55** active `A` record subdomains pointing to the current IP of `mitch.pro` (`DOMAIN_COUNT` in `rotate.py`; `max_domains` in `config.json` overrides it).
 - Separate schedule toggles (can be combined):
-  - **`weekly_enabled`**: 10 rotations/day on weekdays, 5/day on weekends (~1 week lifetime).
-  - **`daily_enabled`**: 28 rotations/day on weekdays, 27/day on weekends (~2 day lifetime).
+  - **`weekly_enabled`**: `max_domains` rotations per week (55 → ~9.2/day weekdays, ~4.6/day weekends; ~1 week lifetime).
+  - **`daily_enabled`**: `max_domains / 2` rotations per day (55 → 27.5/day; ~2 day lifetime).
+  - **`active_hours_only`**: same weekly volume, squeezed into the weekday active-hours window.
   - **`active_hours_only`**: only rotates during local hours **08:30–15:20** on weekdays (no rotations on weekends).
 - Draws from **all public domains** in the FreeDNS registry (cached in `registry_cache.json`).
 - Picks subdomain prefixes randomly from `word_list` across public domains, falling back to 1- or 2-word diceware labels when exhausted.
@@ -72,4 +73,7 @@ sudo loginctl enable-linger mitch
    ```
    `-I` stops Python from importing modules from the script directory or `PYTHON*` env vars. Concurrent runs are serialized with a lock file.
 4. Set `"nginx_sync_enabled": true`, `"nginx_ssh_user"`, `"nginx_ssh_host"`, `"nginx_ssh_port"`, `"nginx_ssh_key"`, and `"certbot_email"` in `config.json` (or via the Web UI).
+
+### Verify Nginx & Certbot
+The **Verify Nginx & Certbot** button opens an HTTPS connection to the nginx server for every verified-working domain (SNI = the domain) and fully validates the certificate (trusted chain, hostname, expiry). If any fail it runs a sync, then re-checks those and reports what is still broken. Checks go to `nginx_check_host` if set, else `nginx_ssh_host`, else the IP of `target_domain` (set `nginx_check_host` to the server's LAN IP if your router doesn't do hairpin NAT).
 

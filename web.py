@@ -23,6 +23,7 @@ from freedns_client import AuthenticationError, FreeDNSClient
 from rotate import (
     advance_rotation_time,
     build_client,
+    check_nginx_sync,
     choose_parent_domains,
     clear_all_domains,
     compute_replacement_times,
@@ -42,6 +43,7 @@ from rotate import (
     resolve_target_ip,
     rotate_once,
     sync_rotation_rates,
+    syncable_fqdns,
     trigger_nginx_sync,
     utc_now,
 )
@@ -386,6 +388,29 @@ class RotatorController:
             self._persist(target_ip)
             self.log("Synced working domains to Nginx & Certbot.")
 
+    def verify_sync(self) -> dict[str, Any]:
+        """Check every verified-working domain serves valid HTTPS; sync if any don't."""
+        with self.lock:
+            fqdns = syncable_fqdns(self.state, self.config)
+        failing = check_nginx_sync(fqdns, self.config)  # network checks run outside the lock
+        result: dict[str, Any] = {"checked": len(fqdns), "failing": sorted(failing), "synced": False}
+        if not failing:
+            self.log(f"Sync check: all {len(fqdns)} working domain(s) serve valid HTTPS.")
+            result["still_failing"] = {}
+            return result
+
+        self.log(f"Sync check: {len(failing)}/{len(fqdns)} not serving valid HTTPS; syncing...")
+        self.sync_nginx()
+        result["synced"] = True
+        still = check_nginx_sync(sorted(failing), self.config)
+        result["still_failing"] = still
+        if still:
+            for fqdn, err in sorted(still.items()):
+                self.log(f"Sync check: still failing {fqdn}: {err}")
+        else:
+            self.log(f"Sync check: fixed all {len(failing)} domain(s).")
+        return result
+
     def update_config(self, updates: dict[str, Any]) -> None:
         with self.lock:
             if "weekly_enabled" in updates:
@@ -494,8 +519,8 @@ class RotatorController:
                 "nginx_ssh_host": str(self.config.get("nginx_ssh_host", "")),
                 "nginx_ssh_port": int(self.config.get("nginx_ssh_port", 22)),
                 "speed_multiplier": float(self.config.get("speed_multiplier", 1)),
-                "weekday_rotations_per_day": int(self.config["weekday_rotations_per_day"]),
-                "weekend_rotations_per_day": int(self.config["weekend_rotations_per_day"]),
+                "weekday_rotations_per_day": float(self.config["weekday_rotations_per_day"]),
+                "weekend_rotations_per_day": float(self.config["weekend_rotations_per_day"]),
                 "word_list": self.config.get("word_list", []),
                 "banned_domains": normalize_banned_domains(self.config.get("banned_domains", [])),
                 "next_rotation_at": self.next_rot.strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -600,7 +625,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <div class="grid">
     <div class="card"><div class="label">Target A Record</div><div class="val mono" id="targetIp">-</div><div class="sub" id="targetDomain">-</div></div>
-    <div class="card"><div class="label">Active Domains</div><div class="val" id="activeCount">0 / 55</div><div class="sub">Max cap enforced</div></div>
+    <div class="card"><div class="label">Active Domains</div><div class="val" id="activeCount">-</div><div class="sub">Max cap enforced</div></div>
     <div class="card"><div class="label">Verified Working</div><div class="val" id="workingCount">0</div><div class="sub">DNS resolves to target</div></div>
     <div class="card"><div class="label">Retired Domains</div><div class="val" id="oldCount">0</div><div class="sub">Never reused</div></div>
     <div class="card"><div class="label">Next Rotation</div><div class="val" id="nextIn">-</div><div class="sub" id="nextAt">-</div></div>
@@ -613,6 +638,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <button onclick="api('/api/import-account')">Import Account Domains</button>
     <button onclick="api('/api/refresh-dns')">Check Working DNS</button>
     <button onclick="api('/api/sync-nginx')">Sync Nginx &amp; Certbot</button>
+    <button id="verifySyncBtn" onclick="verifySync()">Verify Nginx &amp; Certbot</button>
     <button class="danger" onclick="clearAll()">Clear ALL Domains</button>
   </div>
 
@@ -679,6 +705,24 @@ async function api(url, body) {
   if (!res.ok) alert(data.error || 'Request failed');
   if (url !== '/api/status') refresh();
   return data;
+}
+
+async function verifySync() {
+  const btn = document.getElementById('verifySyncBtn');
+  btn.disabled = true; const label = btn.textContent; btn.textContent = 'Verifying...';
+  try {
+    const d = await api('/api/verify-sync');
+    if (d.error) return;
+    const still = Object.entries(d.still_failing || {});
+    let msg = `Checked ${d.checked} working domain(s).\n`;
+    if (!d.failing.length) msg += 'All serve valid HTTPS. Nothing to sync.';
+    else {
+      msg += `${d.failing.length} were not serving valid HTTPS; ran a sync.\n`;
+      msg += still.length ? `Still failing (${still.length}):\n` + still.map(([f, e]) => `- ${f}: ${e}`).join('\n')
+                          : 'All fixed.';
+    }
+    alert(msg);
+  } finally { btn.disabled = false; btn.textContent = label; }
 }
 
 async function clearAll() {
@@ -918,7 +962,7 @@ STATUS_PAGE = """<!DOCTYPE html>
 
   <div class="grid">
     <div class="card"><div class="label">Target A Record</div><div class="val mono" id="targetIp">-</div><div class="sub" id="targetDomain">-</div></div>
-    <div class="card"><div class="label">Active Domains</div><div class="val" id="activeCount">0 / 55</div><div class="sub" id="modeText">-</div></div>
+    <div class="card"><div class="label">Active Domains</div><div class="val" id="activeCount">-</div><div class="sub" id="modeText">-</div></div>
     <div class="card"><div class="label">Verified Working</div><div class="val" id="workingCount">0</div><div class="sub">DNS resolves properly</div></div>
     <div class="card"><div class="label">Retired Domains</div><div class="val" id="oldCount">0</div><div class="sub">Never reused</div></div>
     <div class="card"><div class="label">Next Rotation</div><div class="val" id="nextIn">-</div><div class="sub" id="nextAt">-</div></div>
@@ -1126,6 +1170,8 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
                 elif path == "/api/import-account":
                     added, total = controller.import_account()
                     self._send_json(HTTPStatus.OK, {"ok": True, "added": added, "total": total})
+                elif path == "/api/verify-sync":
+                    self._send_json(HTTPStatus.OK, {"ok": True, **controller.verify_sync()})
                 elif path == "/api/sync-nginx":
                     controller.sync_nginx()
                     self._send_json(HTTPStatus.OK, {"ok": True})

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """FreeDNS subdomain rotation script.
 
-Maintains up to 60 active A-record subdomains pointing to mitch.pro's IP,
-rotating 10x/day on weekdays and 5x/day on weekends (with configurable speed
-multiplier for testing), tracking active replacement times and retired domains.
+Maintains up to DOMAIN_COUNT (default 55) active A-record subdomains pointing to
+mitch.pro's IP. Weekly mode rotates DOMAIN_COUNT times per week (each domain lives
+~1 week); daily mode replaces each domain ~every 2 days. Speed multiplier for testing.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from pathlib import Path
 import secrets
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -34,16 +35,32 @@ from freedns_client import (
     SubdomainTakenError,
 )
 
-def sync_rotation_rates(config: dict[str, Any]) -> tuple[int, int]:
-    """Compute effective (weekday, weekend) rotations/day from weekly_enabled + daily_enabled."""
+# Number of active domains to keep, and the weekly rotation volume (one full turnover
+# per week). Change this one constant; `max_domains` in config.json overrides it, and
+# the rotation volume always follows the effective max_domains so the two stay matched.
+DOMAIN_COUNT = 55
+
+
+def sync_rotation_rates(config: dict[str, Any]) -> tuple[float, float]:
+    """Compute effective (weekday, weekend) rotations/day from weekly_enabled + daily_enabled.
+
+    weekly: max_domains rotations per week, weekdays weighted 2:1 over weekend days.
+    daily:  every domain replaced ~every 2 days (max_domains / 2 per day, every day).
+    """
+    count = max(1, int(config.get("max_domains", DOMAIN_COUNT)))
     weekly = bool(config.get("weekly_enabled", True))
     daily = bool(config.get("daily_enabled", False))
-    wkday = (10 if weekly else 0) + (28 if daily else 0)
-    wkend = (5 if weekly else 0) + (27 if daily else 0)
-    if wkday == 0 and wkend == 0:
-        wkday, wkend = 10, 5
-    config["weekday_rotations_per_day"] = wkday
-    config["weekend_rotations_per_day"] = wkend
+    if not weekly and not daily:
+        weekly = True
+    wkday = wkend = 0.0
+    if weekly:
+        wkday += count * 2 / 12  # 5 weekdays * 2 + 2 weekend days * 1 = 12 weight units
+        wkend += count / 12
+    if daily:
+        wkday += count / 2
+        wkend += count / 2
+    config["weekday_rotations_per_day"] = round(wkday, 2)
+    config["weekend_rotations_per_day"] = round(wkend, 2)
     return wkday, wkend
 
 
@@ -142,21 +159,40 @@ def get_interval_seconds(dt: datetime, config: dict[str, Any]) -> float:
     local_dt = dt.astimezone()
     is_weekend = local_dt.weekday() >= 5
     rotations = float(wkend if is_weekend else wkday)
-    rotations = max(1.0, rotations)
+    rotations = max(0.01, rotations)
     speed = max(0.001, float(config.get("speed_multiplier", 1.0)))
     if config.get("active_hours_only", False):
+        # Same weekly volume as normal mode, squeezed into the weekday windows:
+        # weekend rotations are redistributed across the 5 active weekdays.
         sh, sm = _parse_hhmm(str(config.get("active_hours_start", "08:30")))
         eh, em = _parse_hhmm(str(config.get("active_hours_end", "15:20")))
         window_secs = max(60.0, ((eh * 60 + em) - (sh * 60 + sm)) * 60.0)
-        return (window_secs / rotations) / speed
+        per_active_day = max(0.01, (5 * wkday + 2 * wkend) / 5.0)
+        return (window_secs / per_active_day) / speed
     return (86400.0 / rotations) / speed
 
 
+def _advance_active_time(dt: datetime, seconds: float, config: dict[str, Any]) -> datetime:
+    """Move forward by `seconds` of *active* time, skipping time outside active windows.
+    Leftover time carries into the next window, so fractional per-day rates stay exact."""
+    eh, em = _parse_hhmm(str(config.get("active_hours_end", "15:20")))
+    t = next_active_window_start(dt, config)
+    remaining = seconds
+    for _ in range(10000):
+        local = t.astimezone()
+        window_end = local.replace(hour=eh, minute=em, second=0, microsecond=0).astimezone(timezone.utc)
+        available = (window_end - t).total_seconds()
+        if remaining < available:
+            return t + timedelta(seconds=remaining)
+        remaining -= max(0.0, available)
+        t = next_active_window_start(window_end, config)
+    return t
+
+
 def advance_rotation_time(dt: datetime, config: dict[str, Any]) -> datetime:
-    nxt = dt + timedelta(seconds=get_interval_seconds(dt, config))
-    if config.get("active_hours_only", False) and not is_in_active_hours(nxt, config):
-        return next_active_window_start(nxt, config)
-    return nxt
+    if config.get("active_hours_only", False):
+        return _advance_active_time(dt, get_interval_seconds(dt, config), config)
+    return dt + timedelta(seconds=get_interval_seconds(dt, config))
 
 
 def compute_replacement_times(
@@ -208,6 +244,7 @@ def load_config(path: Path) -> dict[str, Any]:
         cfg["password"] = os.environ["FREEDNS_PASSWORD"]
     if os.environ.get("FREEDNS_COOKIE"):
         cfg["dns_cookie"] = os.environ["FREEDNS_COOKIE"]
+    cfg.setdefault("max_domains", DOMAIN_COUNT)
     sync_rotation_rates(cfg)
     return cfg
 
@@ -597,6 +634,42 @@ def rotate_once(
     return target_ip
 
 
+def syncable_fqdns(state: dict[str, Any], config: dict[str, Any]) -> list[str]:
+    """Verified-working, non-banned FQDNs that should be served by nginx."""
+    return sorted(
+        d["fqdn"].lower()
+        for d in state.get("active_domains", [])
+        if d.get("working") and not is_banned(d["fqdn"], config)
+    )
+
+
+def check_https(fqdn: str, host: str, timeout: float = 8.0) -> str | None:
+    """Connect to host:443 with SNI=fqdn and fully verify the cert. None if OK, else the error."""
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((host, 443), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=fqdn):
+                return None
+    except ssl.SSLCertVerificationError as exc:
+        return f"certificate: {exc.verify_message or exc}"
+    except (OSError, ssl.SSLError) as exc:
+        return f"connection: {exc}"
+
+
+def check_nginx_sync(fqdns: list[str], config: dict[str, Any]) -> dict[str, str]:
+    """Return {fqdn: error} for every fqdn that the nginx server doesn't serve with a valid cert."""
+    if not fqdns:
+        return {}
+    host = (
+        str(config.get("nginx_check_host", "")).strip()
+        or str(config.get("nginx_ssh_host", "")).strip()
+        or resolve_target_ip(config["target_domain"])
+    )
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = pool.map(lambda f: (f, check_https(f, host)), fqdns)
+    return {f: err for f, err in results if err}
+
+
 def trigger_nginx_sync(
     state: dict[str, Any],
     config: dict[str, Any],
@@ -607,11 +680,7 @@ def trigger_nginx_sync(
     if not force and not config.get("nginx_sync_enabled", False):
         return False
 
-    working_fqdns = sorted(
-        d["fqdn"].lower()
-        for d in state.get("active_domains", [])
-        if d.get("working") and not is_banned(d["fqdn"], config)
-    )
+    working_fqdns = syncable_fqdns(state, config)
     if not force and working_fqdns == state.get("last_synced_working", []):
         return False
 
@@ -749,7 +818,7 @@ def main() -> int:
     parser.add_argument("--weekly", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable weekly schedule (10/5)")
     parser.add_argument("--daily", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable daily 2-day schedule (28/27)")
     parser.add_argument("--active-hours", action=argparse.BooleanOptionalAction, default=None, help="Only rotate 08:30-15:20 on weekdays")
-    parser.add_argument("--max-domains", type=int, default=None, help="Override max_domains (default 55)")
+    parser.add_argument("--max-domains", type=int, default=None, help=f"Override max_domains (default {DOMAIN_COUNT})")
     parser.add_argument("--once", action="store_true", help="Run one rotation step and exit")
     parser.add_argument("--bootstrap", type=int, default=0, help="Create N subdomains immediately before rotating")
     parser.add_argument("--status", action="store_true", help="Refresh/show active & working domain lists and exit")

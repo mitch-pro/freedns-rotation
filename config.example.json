@@ -36,6 +36,7 @@
   "nginx_ssh_host": "",
   "nginx_ssh_port": 22,
   "nginx_ssh_key": "",
+  "nginx_check_host": "",
   "nginx_conf_path": "/etc/nginx/nginx.conf",
   "nginx_locations_snippet": "/etc/nginx/snippets/mitch-main-locations.conf",
   "certbot_email": ""
