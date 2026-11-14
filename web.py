@@ -999,6 +999,9 @@ setInterval(refresh, 5000);
 """
 
 
+MAX_POST_BYTES = 64 * 1024
+
+
 def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _send_json(self, code: int, payload: Any, extra_headers: dict[str, str] | None = None) -> None:
@@ -1052,12 +1055,25 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
-            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if length < 0:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid Content-Length"})
+                return
+            if length > MAX_POST_BYTES:
+                self.close_connection = True
+                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Request body too large"})
+                return
             raw = self.rfile.read(length) if length > 0 else b"{}"
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
-            except json.JSONDecodeError:
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "JSON body must be an object"})
                 return
 
             if path == "/api/login":
