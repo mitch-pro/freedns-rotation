@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +27,7 @@ from rotate import (
     choose_parent_domains,
     clear_all_domains,
     compute_replacement_times,
+    extract_allowed_word_prefixes,
     format_duration,
     get_interval_seconds,
     import_account_domains,
@@ -585,6 +586,52 @@ class RotatorController:
                 "logs": list(self.logs),
             }
 
+    def get_rules(self) -> dict[str, Any]:
+        """Return cached GoGuardian allow/block rules and *word* prefixes."""
+        allowed_path = self.base_dir / "allowed_sites.txt"
+        blocked_path = self.base_dir / "blocked_sites.txt"
+        rules_json_path = self.base_dir / "goguardian_rules.json"
+
+        allowed = (
+            [l.strip() for l in allowed_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if allowed_path.exists()
+            else []
+        )
+        blocked = (
+            [l.strip() for l in blocked_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if blocked_path.exists()
+            else []
+        )
+
+        policy_hash = ""
+        updated_at = ""
+        if rules_json_path.exists():
+            try:
+                meta = json.loads(rules_json_path.read_text(encoding="utf-8"))
+                policy_hash = str(meta.get("hash") or "")
+                if not allowed and not blocked:
+                    sites = meta.get("value", {}).get("adminSettings", {}).get("sites", {})
+                    allowed = sorted(p for p, info in sites.items() if info.get("isAllowAction"))
+                    blocked = sorted(p for p, info in sites.items() if not info.get("isAllowAction"))
+            except Exception:
+                pass
+            updated_at = datetime.fromtimestamp(rules_json_path.stat().st_mtime, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+        elif allowed_path.exists() or blocked_path.exists():
+            src = allowed_path if allowed_path.exists() else blocked_path
+            updated_at = datetime.fromtimestamp(src.stat().st_mtime, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            )
+
+        return {
+            "policy_hash": policy_hash,
+            "updated_at": updated_at,
+            "allowed": allowed,
+            "blocked": blocked,
+            "word_prefixes": extract_allowed_word_prefixes(allowed),
+        }
+
     def get_public_status(self) -> dict[str, Any]:
         """Read-only public status of all domains (no logs, secrets, or controls)."""
         full = self.get_status()
@@ -726,26 +773,44 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="tab active" onclick="showTab('working', this)">Working Domains</button>
     <button class="tab" onclick="showTab('active', this)">All Active Domains</button>
     <button class="tab" onclick="showTab('old', this)">Old / Retired</button>
+    <button class="tab" onclick="showTab('rules', this)">Rules</button>
     <button class="tab" onclick="showTab('logs', this)">Logs</button>
   </div>
 
   <div class="panel" id="tab-working"></div>
   <div class="panel" id="tab-active" style="display:none"></div>
   <div class="panel" id="tab-old" style="display:none"></div>
+  <div class="panel" id="tab-rules" style="display:none">
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 14px;border-bottom:1px solid var(--border);background:#101622;">
+      <input id="ruleSearch" type="text" placeholder="Filter rules or test domain (e.g. rjuhsd.ca)..." oninput="renderRules()" style="margin:0;flex:1;min-width:220px;">
+      <select id="ruleFilter" onchange="renderRules()" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:7px 10px;font-size:13px;">
+        <option value="all">All Rules</option>
+        <option value="blocked">Blocked Only</option>
+        <option value="allowed">Allowed Only</option>
+        <option value="words">*word* Prefixes</option>
+      </select>
+      <button onclick="loadRules()">Reload</button>
+      <span id="ruleSummary" style="font-size:12px;color:var(--muted);"></span>
+    </div>
+    <div id="ruleTestResult" style="display:none;padding:9px 14px;font-size:12px;border-bottom:1px solid var(--border);background:#0f1520;"></div>
+    <div id="ruleTableWrap"></div>
+  </div>
   <div class="panel" id="tab-logs" style="display:none"><pre id="logPre"></pre></div>
 </div>
 
 <script>
 let currentTab = 'working';
 let cfgLoaded = false;
+let rulesData = null;
 
 function showTab(name, btn) {
   currentTab = name;
   document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
-  ['working','active','old','logs'].forEach(t => {
+  ['working','active','old','rules','logs'].forEach(t => {
     document.getElementById('tab-' + t).style.display = (t === name) ? 'block' : 'none';
   });
+  if (name === 'rules' && !rulesData) loadRules();
 }
 
 async function api(url, body) {
@@ -757,6 +822,7 @@ async function api(url, body) {
   const data = await res.json();
   if (!res.ok) alert(data.error || 'Request failed');
   if (url !== '/api/status') refresh();
+  if (url === '/api/sync-rules' && res.ok) loadRules();
   return data;
 }
 
@@ -802,6 +868,83 @@ async function saveConfig() {
     banned_domains: document.getElementById('cfgBanned').value
   });
   cfgLoaded = false;
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function compilePattern(raw) {
+  let pat = raw.trim().toLowerCase().replace(/\\/+$/, '');
+  if (!pat) return null;
+  const esc = s => s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+  if (pat.startsWith('*.')) {
+    const rest = pat.slice(2).split('*').map(esc).join('.*');
+    return new RegExp('^(?:.*\\\\.)?' + rest + '$');
+  }
+  return new RegExp('^' + pat.split('*').map(esc).join('.*') + '$');
+}
+
+async function loadRules() {
+  const res = await fetch('/api/rules');
+  if (!res.ok) return;
+  rulesData = await res.json();
+  renderRules();
+}
+
+function renderRules() {
+  if (!rulesData) return;
+  const q = (document.getElementById('ruleSearch').value || '').trim().toLowerCase();
+  const filt = document.getElementById('ruleFilter').value;
+  const allowed = rulesData.allowed || [];
+  const blocked = rulesData.blocked || [];
+  const words = rulesData.word_prefixes || [];
+
+  document.getElementById('ruleSummary').textContent =
+    `Allowed: ${allowed.length} · Blocked: ${blocked.length} · *word*: ${words.length}` +
+    (rulesData.updated_at ? ` · Updated: ${rulesData.updated_at}` : '');
+
+  const testBox = document.getElementById('ruleTestResult');
+  const cleanQ = q.replace(/^https?:\\/\\//, '').split('/')[0].replace(/\\.+$/, '');
+  if (cleanQ && cleanQ.includes('.') && !cleanQ.includes('*')) {
+    const allowHit = allowed.find(p => { const rx = compilePattern(p); return rx && rx.test(cleanQ); });
+    const blockHit = blocked.find(p => { const rx = compilePattern(p); return rx && rx.test(cleanQ); });
+    testBox.style.display = 'block';
+    if (allowHit) {
+      testBox.innerHTML = `<span style="color:var(--ok);font-weight:700;">ALLOWED</span> (overrides block) — <span class="mono">${escHtml(cleanQ)}</span> matched allow rule <span class="mono">${escHtml(allowHit)}</span>` +
+        (blockHit ? ` (also in block: <span class="mono">${escHtml(blockHit)}</span>)` : '');
+    } else if (blockHit) {
+      testBox.innerHTML = `<span style="color:var(--danger);font-weight:700;">BLOCKED</span> — <span class="mono">${escHtml(cleanQ)}</span> matched block rule <span class="mono">${escHtml(blockHit)}</span>`;
+    } else {
+      testBox.innerHTML = `<span style="color:var(--muted);font-weight:700;">UNMATCHED</span> — <span class="mono">${escHtml(cleanQ)}</span> does not match any site rule.`;
+    }
+  } else {
+    testBox.style.display = 'none';
+  }
+
+  let rows = [];
+  if (filt === 'words') {
+    rows = words.filter(w => !q || w.toLowerCase().includes(q)).map(w => ({action: '<span style="color:var(--accent);font-weight:700;">PREFIX</span>', pattern: escHtml(w)}));
+  } else {
+    if (filt === 'all' || filt === 'allowed') {
+      for (const p of allowed) {
+        if (!q || p.toLowerCase().includes(q)) rows.push({action: '<span style="color:var(--ok);font-weight:700;">ALLOW</span>', pattern: escHtml(p)});
+      }
+    }
+    if (filt === 'all' || filt === 'blocked') {
+      for (const p of blocked) {
+        if (!q || p.toLowerCase().includes(q)) rows.push({action: '<span style="color:var(--danger);font-weight:700;">BLOCK</span>', pattern: escHtml(p)});
+      }
+    }
+  }
+
+  const limit = 500;
+  const shown = rows.slice(0, limit);
+  const note = rows.length > limit ? `<div style="padding:10px 14px;font-size:12px;color:var(--muted);border-top:1px solid var(--border);">Showing ${limit} of ${rows.length} matching rules. Refine your search to narrow results.</div>` : '';
+  document.getElementById('ruleTableWrap').innerHTML = renderTable([
+    {key:'action', label:'Action'},
+    {key:'pattern', label:'Pattern', mono:true}
+  ], shown) + note;
 }
 
 function renderTable(cols, rows) {
@@ -1152,6 +1295,11 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
                     self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Authentication required"})
                     return
                 self._send_json(HTTPStatus.OK, controller.get_status())
+            elif path == "/api/rules":
+                if not self._is_authed():
+                    self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Authentication required"})
+                    return
+                self._send_json(HTTPStatus.OK, controller.get_rules())
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
