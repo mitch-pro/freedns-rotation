@@ -42,5 +42,12 @@
   "certbot_email": "",
   "rules_sync_enabled": true,
   "rules_check_interval_seconds": 300,
-  "goguardian_interface": ""
+  "goguardian_interface": "",
+  "goguardian_auth": {
+    "email": "",
+    "profile_id": "",
+    "device_id": "",
+    "license_tag": "",
+    "refresh_token": ""
+  }
 }

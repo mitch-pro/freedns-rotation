@@ -558,7 +558,12 @@ def sync_goguardian_rules(
     blocked_out = base_dir / "blocked_sites.txt"
     allowed_out = base_dir / "allowed_sites.txt"
 
-    auth_state = download_rules.load_auth_state(auth_cache)
+    auth_overrides = config.get("goguardian_auth")
+    auth_state = (
+        download_rules.load_auth_state(auth_cache, overrides=auth_overrides)
+        if isinstance(auth_overrides, dict) and any(auth_overrides.values())
+        else download_rules.load_auth_state(auth_cache)
+    )
     interface = str(config.get("goguardian_interface", "")).strip() or None
     res = download_rules.fetch_policy(
         auth_state,
