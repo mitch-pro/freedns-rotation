@@ -1143,7 +1143,8 @@ def main() -> int:
         print(f"[import] Added {added} new domain(s) ({total} total on FreeDNS account).")
         return 0
 
-    registry_domains = choose_parent_domains(client, config)
+    registry_domains = choose_parent_domains(client, config, cache_dir=base_dir)
+    last_registry_check = time.monotonic()
 
     if args.sync_rules:
         words, compiled_allows, compiled_blocks = sync_goguardian_rules(base_dir, config)
@@ -1187,6 +1188,9 @@ def main() -> int:
         rules_interval = float(config.get("rules_check_interval_seconds", 300))
         while running:
             now = utc_now()
+            if (time.monotonic() - last_registry_check) >= 86400.0:
+                registry_domains = choose_parent_domains(client, config, cache_dir=base_dir)
+                last_registry_check = time.monotonic()
             if config.get("rules_sync_enabled", True) and (time.monotonic() - last_rules_check) >= rules_interval:
                 last_rules_check = time.monotonic()
                 try:

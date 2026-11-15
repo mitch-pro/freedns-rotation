@@ -208,6 +208,7 @@ class RotatorController:
         self.logs: deque[str] = deque(maxlen=200)
         self._client: FreeDNSClient | None = None
         self._registry = None
+        self._registry_loaded_at: float = 0.0
         self._last_error: str | None = None
         self._cached_target_ip: str = "unresolved"
         self._cached_target_ip_at: float = 0.0
@@ -235,8 +236,14 @@ class RotatorController:
 
     def _ensure_client(self) -> FreeDNSClient:
         self._ensure_auth_client()
-        if self._registry is None:
-            self._registry = choose_parent_domains(self._client, self.config)
+        if self._registry is None or (time.monotonic() - self._registry_loaded_at) >= 86400.0:
+            try:
+                self._registry = choose_parent_domains(self._client, self.config, cache_dir=self.base_dir)
+            except AuthenticationError:
+                self.log("Session cookie expired; re-logging in...")
+                self._client = reauth_client(self.config)
+                self._registry = choose_parent_domains(self._client, self.config, cache_dir=self.base_dir)
+            self._registry_loaded_at = time.monotonic()
             self.log(f"Loaded {len(self._registry)} public registry domain(s).")
         return self._client
 
