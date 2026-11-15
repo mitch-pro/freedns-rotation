@@ -31,6 +31,7 @@ from rotate import (
     format_duration,
     get_interval_seconds,
     import_account_domains,
+    is_fqdn_blocked,
     is_in_active_hours,
     load_config,
     load_state,
@@ -39,6 +40,7 @@ from rotate import (
     parse_sync_failures,
     parse_iso,
     persist_all_files,
+    prune_unverified_domains,
     reauth_client,
     refresh_working_domains,
     resolve_fqdn_ips,
@@ -224,10 +226,14 @@ class RotatorController:
         self.logs.append(line)
         print(line, flush=True)
 
-    def _ensure_client(self) -> FreeDNSClient:
+    def _ensure_auth_client(self) -> FreeDNSClient:
         if self._client is None:
             self._client = build_client(self.config)
             self.log("Authenticated with FreeDNS.")
+        return self._client
+
+    def _ensure_client(self) -> FreeDNSClient:
+        self._ensure_auth_client()
         if self._registry is None:
             self._registry = choose_parent_domains(self._client, self.config)
             self.log(f"Loaded {len(self._registry)} public registry domain(s).")
@@ -360,6 +366,25 @@ class RotatorController:
                         self.log(f"{entry['fqdn']} now resolves to {expected}")
                 else:
                     entry["working"] = False
+            max_age_hours = float(self.config.get("unverified_max_age_hours", 24))
+            cutoff = timedelta(hours=max(0.1, max_age_hours))
+            has_expired = any(
+                not d.get("working")
+                and not d.get("verified_at")
+                and d.get("created_at")
+                and (now - parse_iso(d["created_at"])) >= cutoff
+                for d in self.state["active_domains"]
+            )
+            if has_expired:
+                client = self._ensure_auth_client()
+                try:
+                    pruned = prune_unverified_domains(client, self.state, self.config, max_age_hours)
+                except AuthenticationError:
+                    self.log("Session cookie expired; re-logging in...")
+                    self._client = reauth_client(self.config)
+                    pruned = prune_unverified_domains(self._client, self.state, self.config, max_age_hours)
+                for fqdn in pruned:
+                    self.log(f"Deleted unverified domain (>24h): {fqdn}")
             self._persist(target_ip)
             working_cnt = sum(1 for d in self.state["active_domains"] if d.get("working"))
             self.log(f"DNS check complete: {working_cnt}/{len(self.state['active_domains'])} working.")
@@ -411,12 +436,19 @@ class RotatorController:
         return lines
 
     def sync_rules(self) -> tuple[int, int]:
-        if not (self.base_dir / "download_rules.py").exists():
-            return 0, 0
         with self.lock:
             words, compiled_allows, compiled_blocks = sync_goguardian_rules(self.base_dir, self.config)
             rotated: list[tuple[str, str]] = []
-            if self.state["active_domains"] and compiled_blocks:
+            blocked_active = (
+                [
+                    d
+                    for d in self.state["active_domains"]
+                    if is_fqdn_blocked(d["fqdn"], compiled_blocks, compiled_allows)
+                ]
+                if self.state["active_domains"] and compiled_blocks
+                else []
+            )
+            if blocked_active:
                 client = self._ensure_client()
                 try:
                     rotated = rotate_blocked_domains(
@@ -735,7 +767,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="primary" onclick="api('/api/rotate-now')">Rotate Now</button>
     <button onclick="api('/api/import-account')">Import Account Domains</button>
     <button onclick="api('/api/refresh-dns')">Check Working DNS</button>
-    <button onclick="api('/api/sync-rules')">Check Rules Now</button>
+    <button id="syncRulesBtn" onclick="syncRules()">Check Rules Now</button>
     <button onclick="api('/api/sync-nginx')">Sync Nginx &amp; Certbot</button>
     <button id="verifySyncBtn" onclick="verifySync()">Verify Nginx &amp; Certbot</button>
     <button class="danger" onclick="clearAll()">Clear ALL Domains</button>
@@ -824,6 +856,14 @@ async function api(url, body) {
   if (url !== '/api/status') refresh();
   if (url === '/api/sync-rules' && res.ok) loadRules();
   return data;
+}
+
+async function syncRules() {
+  const btn = document.getElementById('syncRulesBtn');
+  btn.disabled = true; const label = btn.textContent; btn.textContent = 'Checking...';
+  try {
+    await api('/api/sync-rules');
+  } finally { btn.disabled = false; btn.textContent = label; }
 }
 
 async function verifySync() {

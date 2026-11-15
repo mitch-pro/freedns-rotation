@@ -42,6 +42,7 @@
   "certbot_email": "",
   "rules_sync_enabled": true,
   "rules_check_interval_seconds": 300,
+  "unverified_max_age_hours": 24,
   "goguardian_interface": "",
   "goguardian_auth": {
     "email": "",

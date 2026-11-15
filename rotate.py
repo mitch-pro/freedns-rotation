@@ -349,6 +349,39 @@ def refresh_working_domains(
                 entry["working"] = False
 
 
+def prune_unverified_domains(
+    client: BaseFreeDNSClient,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    max_age_hours: float | None = None,
+) -> list[str]:
+    """Delete active domains that never became working within max_age_hours (default 24h)."""
+    hours = float(config.get("unverified_max_age_hours", 24) if max_age_hours is None else max_age_hours)
+    cutoff = timedelta(hours=max(0.1, hours))
+    now = utc_now()
+    deleted: list[str] = []
+    remaining: list[dict[str, Any]] = []
+
+    for entry in state.get("active_domains", []):
+        if entry.get("working") or entry.get("verified_at") or not entry.get("created_at"):
+            remaining.append(entry)
+            continue
+        age = now - parse_iso(entry["created_at"])
+        if age < cutoff:
+            remaining.append(entry)
+            continue
+        client.delete_subdomain(entry["data_id"])
+        retired = dict(entry)
+        retired["retired_at"] = now.isoformat()
+        retired["retired_reason"] = "unverified_expired"
+        state["old_domains"].append(retired)
+        deleted.append(entry["fqdn"])
+        print(f"[deleted:unverified] {entry['fqdn']} (age={format_duration(age.total_seconds())}, id={entry['data_id']})")
+
+    state["active_domains"] = remaining
+    return deleted
+
+
 def write_working_domains_file(
     working_path: Path,
     state: dict[str, Any],
@@ -548,10 +581,10 @@ def sync_goguardian_rules(
     base_dir: Path,
     config: dict[str, Any],
 ) -> tuple[list[str], list[tuple[str, re.Pattern[str]]], list[tuple[str, re.Pattern[str]]]]:
-    """Run download_rules.py logic, update word_list with *word* allow entries, return (words, allows, blocks)."""
+    """Fetch GoGuardian policy rules, update word_list with *word* allow entries, return (words, allows, blocks)."""
     if str(base_dir) not in sys.path:
         sys.path.insert(0, str(base_dir))
-    import download_rules
+    import goguardian
 
     auth_cache = str(base_dir / "goguardian_auth_cache.json")
     rules_out = base_dir / "goguardian_rules.json"
@@ -560,12 +593,12 @@ def sync_goguardian_rules(
 
     auth_overrides = config.get("goguardian_auth")
     auth_state = (
-        download_rules.load_auth_state(auth_cache, overrides=auth_overrides)
+        goguardian.load_auth_state(auth_cache, overrides=auth_overrides)
         if isinstance(auth_overrides, dict) and any(auth_overrides.values())
-        else download_rules.load_auth_state(auth_cache)
+        else goguardian.load_auth_state(auth_cache)
     )
     interface = str(config.get("goguardian_interface", "")).strip() or None
-    res = download_rules.fetch_policy(
+    res = goguardian.fetch_policy(
         auth_state,
         auth_cache,
         **({"interface": interface} if interface else {}),
@@ -787,6 +820,7 @@ def rotate_once(
     active.append(new_entry)
     state["active_domains"] = active
     refresh_working_domains(state, target_ip, config)
+    prune_unverified_domains(client, state, config)
     return target_ip
 
 
