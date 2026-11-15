@@ -41,5 +41,6 @@
   "nginx_locations_snippet": "/etc/nginx/snippets/mitch-main-locations.conf",
   "certbot_email": "",
   "rules_sync_enabled": true,
-  "rules_check_interval_seconds": 300
+  "rules_check_interval_seconds": 300,
+  "goguardian_interface": ""
 }

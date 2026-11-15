@@ -475,6 +475,8 @@ class RotatorController:
                 self.config["nginx_ssh_host"] = str(updates["nginx_ssh_host"]).strip()
             if "nginx_ssh_port" in updates:
                 self.config["nginx_ssh_port"] = max(1, min(65535, int(updates["nginx_ssh_port"])))
+            if "goguardian_interface" in updates:
+                self.config["goguardian_interface"] = str(updates["goguardian_interface"]).strip()
             sync_rotation_rates(self.config)
             if "speed_multiplier" in updates:
                 self.config["speed_multiplier"] = max(0.01, float(updates["speed_multiplier"]))
@@ -566,6 +568,7 @@ class RotatorController:
                 "nginx_ssh_user": str(self.config.get("nginx_ssh_user", "root")),
                 "nginx_ssh_host": str(self.config.get("nginx_ssh_host", "")),
                 "nginx_ssh_port": int(self.config.get("nginx_ssh_port", 22)),
+                "goguardian_interface": str(self.config.get("goguardian_interface", "")),
                 "speed_multiplier": float(self.config.get("speed_multiplier", 1)),
                 "weekday_rotations_per_day": float(self.config["weekday_rotations_per_day"]),
                 "weekend_rotations_per_day": float(self.config["weekend_rotations_per_day"]),
@@ -712,6 +715,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div><label class="label">SSH User<input id="cfgSshUser" type="text" placeholder="root"></label></div>
       <div><label class="label">SSH Host<input id="cfgSshHost" type="text" placeholder="mitch.pro"></label></div>
       <div><label class="label">SSH Port<input id="cfgSshPort" type="number" placeholder="22"></label></div>
+      <div><label class="label">GoGuardian Interface<input id="cfgGgInterface" type="text" placeholder="eth1 (default route if blank)"></label></div>
       <div style="grid-column: span 2;"><label class="label">Word List (comma-separated)<input id="cfgWords" type="text"></label></div>
       <div style="grid-column: span 2;"><label class="label">Banned Domains (comma-separated; also bans subdomains)<input id="cfgBanned" type="text" placeholder="groups.id, example.com"></label></div>
       <div><button class="primary" style="width:100%" onclick="saveConfig()">Save Settings</button></div>
@@ -791,6 +795,7 @@ async function saveConfig() {
     nginx_ssh_user: document.getElementById('cfgSshUser').value,
     nginx_ssh_host: document.getElementById('cfgSshHost').value,
     nginx_ssh_port: parseInt(document.getElementById('cfgSshPort').value || '22', 10),
+    goguardian_interface: document.getElementById('cfgGgInterface').value,
     speed_multiplier: parseFloat(document.getElementById('cfgSpeed').value),
     max_domains: parseInt(document.getElementById('cfgMax').value, 10),
     word_list: document.getElementById('cfgWords').value,
@@ -834,6 +839,7 @@ async function refresh() {
     document.getElementById('cfgSshUser').value = d.nginx_ssh_user || 'root';
     document.getElementById('cfgSshHost').value = d.nginx_ssh_host || '';
     document.getElementById('cfgSshPort').value = d.nginx_ssh_port || 22;
+    document.getElementById('cfgGgInterface').value = d.goguardian_interface || '';
     document.getElementById('cfgSpeed').value = d.speed_multiplier;
     document.getElementById('cfgMax').value = d.max_domains;
     document.getElementById('cfgWords').value = d.word_list.join(', ');

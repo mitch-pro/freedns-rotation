@@ -559,7 +559,12 @@ def sync_goguardian_rules(
     allowed_out = base_dir / "allowed_sites.txt"
 
     auth_state = download_rules.load_auth_state(auth_cache)
-    res = download_rules.fetch_policy(auth_state, auth_cache)
+    interface = str(config.get("goguardian_interface", "")).strip() or None
+    res = download_rules.fetch_policy(
+        auth_state,
+        auth_cache,
+        **({"interface": interface} if interface else {}),
+    )
     policy_data = {"value": res["policy"], "hash": res.get("policyHash")}
     rules_out.write_text(json.dumps(policy_data, indent=2), encoding="utf-8")
 
