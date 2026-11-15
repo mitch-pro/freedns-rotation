@@ -28,6 +28,7 @@ from rotate import (
     clear_all_domains,
     compute_replacement_times,
     extract_allowed_word_prefixes,
+    fill_to_max_domains,
     format_duration,
     get_interval_seconds,
     import_account_domains,
@@ -328,6 +329,26 @@ class RotatorController:
                 f"Rotated: active={len(self.state['active_domains'])}/{self.config['max_domains']}, "
                 f"working={working_cnt}, next in {format_duration(interval)}"
             )
+
+    def fill_all(self) -> tuple[int, int]:
+        with self.lock:
+            client = self._ensure_client()
+            target_ip = resolve_target_ip(self.config["target_domain"])
+            created = 0
+            try:
+                try:
+                    target_ip, created = fill_to_max_domains(client, self.state, self.config, self._registry)
+                except AuthenticationError:
+                    self.log("Session cookie expired; re-logging in...")
+                    self._client = reauth_client(self.config)
+                    target_ip, created = fill_to_max_domains(self._client, self.state, self.config, self._registry)
+            finally:
+                self._persist(target_ip)
+            self._last_error = None
+            self.log(
+                f"Filled {created} domain(s): active={len(self.state['active_domains'])}/{self.config['max_domains']}."
+            )
+            return created, len(self.state["active_domains"])
 
     def refresh_dns(self) -> None:
         with self.lock:
@@ -765,6 +786,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="green" onclick="api('/api/start')">Start Rotation</button>
     <button onclick="api('/api/pause')">Pause</button>
     <button class="primary" onclick="api('/api/rotate-now')">Rotate Now</button>
+    <button id="fillAllBtn" class="primary" onclick="fillAll()">Fill All Up to Max</button>
     <button onclick="api('/api/import-account')">Import Account Domains</button>
     <button onclick="api('/api/refresh-dns')">Check Working DNS</button>
     <button id="syncRulesBtn" onclick="syncRules()">Check Rules Now</button>
@@ -856,6 +878,16 @@ async function api(url, body) {
   if (url !== '/api/status') refresh();
   if (url === '/api/sync-rules' && res.ok) loadRules();
   return data;
+}
+
+async function fillAll() {
+  if (!confirm('Generate subdomains up to max_domains now? This may take a moment.')) return;
+  const btn = document.getElementById('fillAllBtn');
+  btn.disabled = true; const label = btn.textContent; btn.textContent = 'Generating...';
+  try {
+    const d = await api('/api/fill-all');
+    if (d && d.ok) alert(`Created ${d.created} domain(s). Active: ${d.total}.`);
+  } finally { btn.disabled = false; btn.textContent = label; }
 }
 
 async function syncRules() {
@@ -1407,6 +1439,9 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
                 elif path == "/api/rotate-now":
                     controller.rotate_now()
                     self._send_json(HTTPStatus.OK, {"ok": True})
+                elif path == "/api/fill-all":
+                    created, total = controller.fill_all()
+                    self._send_json(HTTPStatus.OK, {"ok": True, "created": created, "total": total})
                 elif path == "/api/refresh-dns":
                     controller.refresh_dns()
                     self._send_json(HTTPStatus.OK, {"ok": True})

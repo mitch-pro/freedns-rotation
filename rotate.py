@@ -824,6 +824,39 @@ def rotate_once(
     return target_ip
 
 
+def fill_to_max_domains(
+    client: BaseFreeDNSClient,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    registry_domains: list[RegistryDomain],
+) -> tuple[str, int]:
+    """Create unique subdomains until active_domains reaches max_domains."""
+    target_ip = resolve_target_ip(config["target_domain"])
+    sync_state_with_account(client, state)
+
+    max_domains = int(config["max_domains"])
+    active = sorted(state["active_domains"], key=lambda d: d["created_at"])
+
+    for banned in [d for d in active if is_banned(d["fqdn"], config)]:
+        client.delete_subdomain(banned["data_id"])
+        active.remove(banned)
+        retired = dict(banned)
+        retired["retired_at"] = utc_now().isoformat()
+        retired["retired_reason"] = "banned"
+        state["old_domains"].append(retired)
+        print(f"[deleted:banned] {banned['fqdn']} (id={banned['data_id']})")
+
+    state["active_domains"] = active
+    created = 0
+    while len(state["active_domains"]) < max_domains:
+        new_entry = create_unique_subdomain(client, state, config, target_ip, registry_domains)
+        state["active_domains"].append(new_entry)
+        created += 1
+
+    refresh_working_domains(state, target_ip, config)
+    return target_ip, created
+
+
 def syncable_fqdns(state: dict[str, Any], config: dict[str, Any]) -> list[str]:
     """Verified-working, non-banned FQDNs that should be served by nginx."""
     return sorted(
