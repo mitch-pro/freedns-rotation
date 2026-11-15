@@ -35,13 +35,16 @@ from rotate import (
     load_state,
     next_active_window_start,
     normalize_banned_domains,
+    parse_sync_failures,
     parse_iso,
     persist_all_files,
     reauth_client,
     refresh_working_domains,
     resolve_fqdn_ips,
     resolve_target_ip,
+    rotate_blocked_domains,
     rotate_once,
+    sync_goguardian_rules,
     sync_rotation_rates,
     syncable_fqdns,
     trigger_nginx_sync,
@@ -243,12 +246,22 @@ class RotatorController:
 
     def _loop(self) -> None:
         last_dns_check = 0.0
+        last_rules_check = 0.0
         while True:
             with self.lock:
                 should_run = self.running
                 has_pending_dns = any(not d.get("working") for d in self.state["active_domains"])
+                rules_enabled = bool(self.config.get("rules_sync_enabled", True))
+                rules_interval = float(self.config.get("rules_check_interval_seconds", 300))
 
             now_mono = time.monotonic()
+            if rules_enabled and (now_mono - last_rules_check) >= rules_interval:
+                last_rules_check = now_mono
+                try:
+                    self.sync_rules()
+                except Exception as exc:
+                    self.log(f"Rules check error: {exc}")
+
             if has_pending_dns and (now_mono - last_dns_check) >= 30.0:
                 last_dns_check = now_mono
                 try:
@@ -381,12 +394,44 @@ class RotatorController:
             self.log(f"Imported {added} new domain(s) from FreeDNS ({total} total on account).")
             return added, total
 
-    def sync_nginx(self) -> None:
+    def sync_nginx(self) -> list[str]:
+        """Run a forced sync; returns the sync output lines (also written to the log)."""
+        lines: list[str] = []
+
+        def collect(line: str) -> None:
+            lines.append(line)
+            self.log(line)
+
         with self.lock:
-            trigger_nginx_sync(self.state, self.config, self.base_dir, force=True)
+            trigger_nginx_sync(self.state, self.config, self.base_dir, force=True, log=collect)
             target_ip = resolve_target_ip(self.config["target_domain"])
             self._persist(target_ip)
             self.log("Synced working domains to Nginx & Certbot.")
+        return lines
+
+    def sync_rules(self) -> tuple[int, int]:
+        if not (self.base_dir / "download_rules.py").exists():
+            return 0, 0
+        with self.lock:
+            words, compiled_allows, compiled_blocks = sync_goguardian_rules(self.base_dir, self.config)
+            rotated: list[tuple[str, str]] = []
+            if self.state["active_domains"] and compiled_blocks:
+                client = self._ensure_client()
+                try:
+                    rotated = rotate_blocked_domains(
+                        client, self.state, self.config, self._registry, compiled_blocks, compiled_allows
+                    )
+                except AuthenticationError:
+                    self.log("Session cookie expired; re-logging in...")
+                    self._client = reauth_client(self.config)
+                    rotated = rotate_blocked_domains(
+                        self._client, self.state, self.config, self._registry, compiled_blocks, compiled_allows
+                    )
+            if rotated or words:
+                target_ip = resolve_target_ip(self.config["target_domain"])
+                self._persist(target_ip)
+            self.log(f"Rules sync: {len(words)} *word* prefixes, rotated {len(rotated)} blocked domain(s).")
+            return len(words), len(rotated)
 
     def verify_sync(self) -> dict[str, Any]:
         """Check every verified-working domain serves valid HTTPS; sync if any don't."""
@@ -400,13 +445,16 @@ class RotatorController:
             return result
 
         self.log(f"Sync check: {len(failing)}/{len(fqdns)} not serving valid HTTPS; syncing...")
-        self.sync_nginx()
+        sync_lines = self.sync_nginx()
+        reasons = parse_sync_failures("\n".join(l.removeprefix("[sync] ") for l in sync_lines))
         result["synced"] = True
         still = check_nginx_sync(sorted(failing), self.config)
         result["still_failing"] = still
+        result["sync_errors"] = {f: reasons[f] for f in still if f in reasons}
         if still:
             for fqdn, err in sorted(still.items()):
-                self.log(f"Sync check: still failing {fqdn}: {err}")
+                why = f" | sync: {reasons[fqdn]}" if fqdn in reasons else ""
+                self.log(f"Sync check: still failing {fqdn}: {err}{why}")
         else:
             self.log(f"Sync check: fixed all {len(failing)} domain(s).")
         return result
@@ -637,6 +685,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="primary" onclick="api('/api/rotate-now')">Rotate Now</button>
     <button onclick="api('/api/import-account')">Import Account Domains</button>
     <button onclick="api('/api/refresh-dns')">Check Working DNS</button>
+    <button onclick="api('/api/sync-rules')">Check Rules Now</button>
     <button onclick="api('/api/sync-nginx')">Sync Nginx &amp; Certbot</button>
     <button id="verifySyncBtn" onclick="verifySync()">Verify Nginx &amp; Certbot</button>
     <button class="danger" onclick="clearAll()">Clear ALL Domains</button>
@@ -718,8 +767,11 @@ async function verifySync() {
     if (!d.failing.length) msg += 'All serve valid HTTPS. Nothing to sync.';
     else {
       msg += `${d.failing.length} were not serving valid HTTPS; ran a sync.\\n`;
-      msg += still.length ? `Still failing (${still.length}):\\n` + still.map(([f, e]) => `- ${f}: ${e}`).join('\\n')
+      const why = d.sync_errors || {};
+      msg += still.length ? `Still failing (${still.length}):\\n` + still.map(([f, e]) =>
+                              `- ${f}: ${e}` + (why[f] ? `\\n    sync: ${why[f]}` : '')).join('\\n')
                           : 'All fixed.';
+      if (still.length && !Object.keys(why).length) msg += '\\n(No per-domain errors from the sync; see the log panel.)';
     }
     alert(msg);
   } finally { btn.disabled = false; btn.textContent = label; }
@@ -1175,6 +1227,9 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
                 elif path == "/api/sync-nginx":
                     controller.sync_nginx()
                     self._send_json(HTTPStatus.OK, {"ok": True})
+                elif path == "/api/sync-rules":
+                    words_cnt, rotated_cnt = controller.sync_rules()
+                    self._send_json(HTTPStatus.OK, {"ok": True, "words": words_cnt, "rotated": rotated_cnt})
                 elif path == "/api/config":
                     controller.update_config(body)
                     self._send_json(HTTPStatus.OK, {"ok": True})

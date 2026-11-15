@@ -12,3 +12,8 @@ working_domains.txt
 old_domains.txt
 *.bak
 nginx.conf
+download_rules.py
+goguardian_auth_cache.json
+goguardian_rules.json
+blocked_sites.txt
+allowed_sites.txt

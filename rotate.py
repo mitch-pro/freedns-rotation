@@ -22,7 +22,7 @@ import ssl
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 from diceware import generate_diceware_label
 from freedns_client import (
@@ -475,6 +475,148 @@ def is_banned(name: str, config: dict[str, Any]) -> bool:
     )
 
 
+ALLOWED_WORD_RE = re.compile(r"^\*([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\*$")
+
+
+def extract_allowed_word_prefixes(allowed_patterns: list[str]) -> list[str]:
+    """Extract *word* entries from allowed_sites (no dots/slashes) as subdomain prefixes."""
+    words: list[str] = []
+    for raw in allowed_patterns:
+        m = ALLOWED_WORD_RE.match(raw.strip().lower())
+        if m:
+            w = m.group(1)
+            if w not in words:
+                words.append(w)
+    return words
+
+
+def compile_site_patterns(patterns: list[str]) -> list[tuple[str, re.Pattern[str]]]:
+    """Compile GoGuardian site wildcard patterns into regexes."""
+    compiled: list[tuple[str, re.Pattern[str]]] = []
+    for raw in patterns:
+        pat = raw.strip().lower().rstrip("/")
+        if not pat:
+            continue
+        if pat.startswith("*."):
+            rest = pat[2:]
+            regex_str = r"^(?:.*\.)?" + r".*".join(re.escape(part) for part in rest.split("*")) + r"$"
+        else:
+            regex_str = r"^" + r".*".join(re.escape(part) for part in pat.split("*")) + r"$"
+        compiled.append((raw.strip(), re.compile(regex_str)))
+    return compiled
+
+
+compile_block_patterns = compile_site_patterns
+
+
+def is_fqdn_blocked(
+    fqdn: str,
+    compiled_blocks: list[tuple[str, re.Pattern[str]]],
+    compiled_allows: list[tuple[str, re.Pattern[str]]] | None = None,
+) -> str | None:
+    """Return matching block pattern if fqdn is blocked and NOT overridden by an allow rule."""
+    clean = fqdn.strip().lower().rstrip(".")
+    if compiled_allows:
+        for _raw, rx in compiled_allows:
+            if rx.match(clean):
+                return None
+    for raw, rx in compiled_blocks:
+        if rx.match(clean):
+            return raw
+    return None
+
+
+def load_compiled_rules(
+    base_dir: Path,
+) -> tuple[list[tuple[str, re.Pattern[str]]], list[tuple[str, re.Pattern[str]]]]:
+    allowed_path = base_dir / "allowed_sites.txt"
+    blocked_path = base_dir / "blocked_sites.txt"
+    allows = (
+        compile_site_patterns([l.strip() for l in allowed_path.read_text(encoding="utf-8").splitlines() if l.strip()])
+        if allowed_path.exists()
+        else []
+    )
+    blocks = (
+        compile_site_patterns([l.strip() for l in blocked_path.read_text(encoding="utf-8").splitlines() if l.strip()])
+        if blocked_path.exists()
+        else []
+    )
+    return allows, blocks
+
+
+def sync_goguardian_rules(
+    base_dir: Path,
+    config: dict[str, Any],
+) -> tuple[list[str], list[tuple[str, re.Pattern[str]]], list[tuple[str, re.Pattern[str]]]]:
+    """Run download_rules.py logic, update word_list with *word* allow entries, return (words, allows, blocks)."""
+    if str(base_dir) not in sys.path:
+        sys.path.insert(0, str(base_dir))
+    import download_rules
+
+    auth_cache = str(base_dir / "goguardian_auth_cache.json")
+    rules_out = base_dir / "goguardian_rules.json"
+    blocked_out = base_dir / "blocked_sites.txt"
+    allowed_out = base_dir / "allowed_sites.txt"
+
+    auth_state = download_rules.load_auth_state(auth_cache)
+    res = download_rules.fetch_policy(auth_state, auth_cache)
+    policy_data = {"value": res["policy"], "hash": res.get("policyHash")}
+    rules_out.write_text(json.dumps(policy_data, indent=2), encoding="utf-8")
+
+    sites = policy_data["value"].get("adminSettings", {}).get("sites", {})
+    blocked = sorted(p for p, info in sites.items() if not info.get("isAllowAction"))
+    allowed = sorted(p for p, info in sites.items() if info.get("isAllowAction"))
+
+    blocked_out.write_text("\n".join(blocked) + "\n", encoding="utf-8")
+    allowed_out.write_text("\n".join(allowed) + "\n", encoding="utf-8")
+
+    word_prefixes = extract_allowed_word_prefixes(allowed)
+    if word_prefixes:
+        config["word_list"] = word_prefixes
+
+    return word_prefixes, compile_site_patterns(allowed), compile_site_patterns(blocked)
+
+
+def rotate_blocked_domains(
+    client: BaseFreeDNSClient,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    registry_domains: list[RegistryDomain],
+    compiled_blocks: list[tuple[str, re.Pattern[str]]],
+    compiled_allows: list[tuple[str, re.Pattern[str]]] | None = None,
+) -> list[tuple[str, str]]:
+    """Rotate out any active domain matching blocked_sites (unless allowed) and replace with a unique one."""
+    if not compiled_blocks:
+        return []
+
+    target_ip = resolve_target_ip(config["target_domain"])
+    rotated: list[tuple[str, str]] = []
+    remaining: list[dict[str, Any]] = []
+
+    for entry in state["active_domains"]:
+        matched = is_fqdn_blocked(entry["fqdn"], compiled_blocks, compiled_allows)
+        if not matched:
+            remaining.append(entry)
+            continue
+
+        print(f"[blocked] {entry['fqdn']} matched rule {matched!r}; rotating...")
+        client.delete_subdomain(entry["data_id"])
+        retired = dict(entry)
+        retired["retired_at"] = utc_now().isoformat()
+        retired["retired_reason"] = f"blocked:{matched}"
+        state["old_domains"].append(retired)
+
+        state["active_domains"] = remaining
+        new_entry = create_unique_subdomain(client, state, config, target_ip, registry_domains)
+        remaining.append(new_entry)
+        rotated.append((entry["fqdn"], new_entry["fqdn"]))
+
+    state["active_domains"] = remaining
+    if rotated:
+        refresh_working_domains(state, target_ip, config)
+    return rotated
+
+
 def choose_parent_domains(
     client: BaseFreeDNSClient, config: dict[str, Any], cache_dir: Path | None = None
 ) -> list[RegistryDomain]:
@@ -536,6 +678,7 @@ def create_unique_subdomain(
     old_fqdns = {d["fqdn"].lower() for d in state["old_domains"]}
     taken_fqdns = {f.lower() for f in state.get("taken_fqdns", [])}
     blocked_fqdns = active_fqdns | old_fqdns | taken_fqdns
+    compiled_allows, compiled_blocks = load_compiled_rules(Path(__file__).resolve().parent)
 
     word_list = [w.strip().lower() for w in config.get("word_list", []) if w.strip()]
     word_candidates = [
@@ -563,6 +706,9 @@ def create_unique_subdomain(
 
         candidate_fqdn = f"{prefix}.{parent.domain}".lower()
         if candidate_fqdn in blocked_fqdns:
+            continue
+        if compiled_blocks and is_fqdn_blocked(candidate_fqdn, compiled_blocks, compiled_allows):
+            blocked_fqdns.add(candidate_fqdn)
             continue
 
         try:
@@ -670,11 +816,45 @@ def check_nginx_sync(fqdns: list[str], config: dict[str, Any]) -> dict[str, str]
     return {f: err for f, err in results if err}
 
 
+CERTBOT_NOISE = (
+    "Saving debug log",
+    "Ask for help or search",
+    "See the logfile",
+    "Some challenges have failed",
+    "- - - -",
+)
+
+
+def parse_sync_failures(output: str) -> dict[str, str]:
+    """Extract per-domain reasons from sync_nginx.py output:
+    "[certbot] Failed for <fqdn>: <multi-line stderr>" and "[nginx-sync] Refusing ... <fqdn>..."."""
+    reasons: dict[str, list[str]] = {}
+    current: str | None = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = re.match(r"^\[certbot\] Failed for (\S+?):\s*(.*)$", line)
+        if m:
+            current = m.group(1).lower()
+            reasons[current] = [m.group(2)] if m.group(2) else []
+            continue
+        m = re.match(r"^\[nginx-sync\] Refusing (?:protected/externally configured name: )?(\S+?):?\s*(.*)$", line)
+        if m:
+            current = None
+            reasons[m.group(1).lower()] = [line.removeprefix("[nginx-sync] ")]
+            continue
+        if line.startswith("["):
+            current = None
+        elif current and line and not any(line.startswith(n) for n in CERTBOT_NOISE):
+            reasons[current].append(line)
+    return {f: (" ".join(parts) or "certbot failed (no details)")[:600] for f, parts in reasons.items()}
+
+
 def trigger_nginx_sync(
     state: dict[str, Any],
     config: dict[str, Any],
     _base_dir: Path,
     force: bool = False,
+    log: Callable[[str], None] | None = None,
 ) -> bool:
     """Sync verified working domains to main server nginx + certbot over SSH."""
     if not force and not config.get("nginx_sync_enabled", False):
@@ -703,10 +883,14 @@ def trigger_nginx_sync(
         text=True,
     )
 
+    output = "\n".join(part for part in (res.stdout.strip(), res.stderr.strip()) if part)
     if res.returncode != 0:
-        raise RuntimeError(f"nginx sync failed: {res.stderr.strip() or res.stdout.strip()}")
-    if res.stdout.strip():
-        print(res.stdout.strip())
+        raise RuntimeError(f"nginx sync failed: {output}")
+    # Surface everything (incl. per-domain certbot failures on stderr), not just stdout.
+    emit = log or print
+    for line in output.splitlines():
+        if line.strip():
+            emit(f"[sync] {line.rstrip()}")
     state["last_synced_working"] = working_fqdns
     return True
 
@@ -823,6 +1007,7 @@ def main() -> int:
     parser.add_argument("--bootstrap", type=int, default=0, help="Create N subdomains immediately before rotating")
     parser.add_argument("--status", action="store_true", help="Refresh/show active & working domain lists and exit")
     parser.add_argument("--import-account", action="store_true", help="Scrape all domains from FreeDNS account and add them")
+    parser.add_argument("--sync-rules", action="store_true", help="Download GoGuardian rules, update word_list, and rotate blocked domains")
     parser.add_argument("--clear-all", action="store_true", help="Delete ALL subdomains from FreeDNS and exit")
     args = parser.parse_args()
 
@@ -883,6 +1068,16 @@ def main() -> int:
 
     registry_domains = choose_parent_domains(client, config)
 
+    if args.sync_rules:
+        words, compiled_allows, compiled_blocks = sync_goguardian_rules(base_dir, config)
+        rotated = rotate_blocked_domains(
+            client, state, config, registry_domains, compiled_blocks, compiled_allows
+        )
+        target_ip = resolve_target_ip(config["target_domain"])
+        persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
+        print(f"[rules] Loaded {len(words)} *word* prefixes, rotated {len(rotated)} blocked domain(s).")
+        return 0
+
     running = True
 
     def _handle_signal(_sig: int, _frame: Any) -> None:
@@ -911,8 +1106,24 @@ def main() -> int:
             f"[start] max={config['max_domains']} speed={config.get('speed_multiplier', 1)}x "
             f"target={config['target_domain']}"
         )
+        last_rules_check = 0.0
+        rules_interval = float(config.get("rules_check_interval_seconds", 300))
         while running:
             now = utc_now()
+            if config.get("rules_sync_enabled", True) and (time.monotonic() - last_rules_check) >= rules_interval:
+                last_rules_check = time.monotonic()
+                try:
+                    words, compiled_allows, compiled_blocks = sync_goguardian_rules(base_dir, config)
+                    rotated = rotate_blocked_domains(
+                        client, state, config, registry_domains, compiled_blocks, compiled_allows
+                    )
+                    if rotated:
+                        target_ip = resolve_target_ip(config["target_domain"])
+                        persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
+                    print(f"[rules] Synced {len(words)} *word* prefixes; rotated {len(rotated)} blocked domain(s).")
+                except Exception as exc:
+                    print(f"[rules] Sync error: {exc}", file=sys.stderr)
+
             if not is_in_active_hours(now, config):
                 next_rot = next_active_window_start(now, config)
                 wait_secs = max(1.0, (next_rot - now).total_seconds())
