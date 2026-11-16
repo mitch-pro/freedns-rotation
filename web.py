@@ -51,6 +51,7 @@ from rotate import (
     reauth_client,
     refresh_working_domains,
     resolve_fqdn_ips,
+    resolve_timezone,
     resolve_target_ip,
     rotate_blocked_domains,
     rotate_once,
@@ -592,6 +593,11 @@ class RotatorController:
                 self.config["daily_enabled"] = bool(updates["daily_enabled"])
             if "active_hours_only" in updates:
                 self.config["active_hours_only"] = bool(updates["active_hours_only"])
+            if "timezone" in updates:
+                tz = str(updates["timezone"]).strip()
+                self.config["timezone"] = tz
+                if tz and resolve_timezone({"timezone": tz}) is None:
+                    self.log(f"Warning: unknown timezone {tz!r}; using server local time.")
             if "nginx_sync_enabled" in updates:
                 self.config["nginx_sync_enabled"] = bool(updates["nginx_sync_enabled"])
             if "nginx_ssh_user" in updates:
@@ -701,6 +707,7 @@ class RotatorController:
                 "weekly_enabled": bool(self.config.get("weekly_enabled", True)),
                 "daily_enabled": bool(self.config.get("daily_enabled", False)),
                 "active_hours_only": bool(self.config.get("active_hours_only", False)),
+                "timezone": str(self.config.get("timezone", "")),
                 "nginx_sync_enabled": bool(self.config.get("nginx_sync_enabled", False)),
                 "nginx_ssh_user": str(self.config.get("nginx_ssh_user", "root")),
                 "nginx_ssh_host": str(self.config.get("nginx_ssh_host", "")),
@@ -909,6 +916,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div><label class="label">SSH User<input id="cfgSshUser" type="text" placeholder="root"></label></div>
       <div><label class="label">SSH Host<input id="cfgSshHost" type="text" placeholder="mitch.pro"></label></div>
       <div><label class="label">SSH Port<input id="cfgSshPort" type="number" placeholder="22"></label></div>
+      <div><label class="label">Active-Hours Timezone<input id="cfgTz" type="text" placeholder="America/Los_Angeles"></label></div>
       <div><label class="label">GoGuardian Interface<input id="cfgGgInterface" type="text" placeholder="eth1 (default route if blank)"></label></div>
       <div style="grid-column: span 2;"><label class="label">Word List (comma-separated)<input id="cfgWords" type="text"></label></div>
       <div style="grid-column: span 2;"><label class="label">Banned Domains (comma-separated; also bans subdomains)<input id="cfgBanned" type="text" placeholder="groups.id, example.com"></label></div>
@@ -1038,6 +1046,7 @@ async function saveConfig() {
     weekly_enabled: document.getElementById('cfgWeekly').checked,
     daily_enabled: document.getElementById('cfgDaily').checked,
     active_hours_only: document.getElementById('cfgActiveHours').checked,
+    timezone: document.getElementById('cfgTz').value,
     nginx_sync_enabled: document.getElementById('cfgNginxSync').checked,
     nginx_ssh_user: document.getElementById('cfgSshUser').value,
     nginx_ssh_host: document.getElementById('cfgSshHost').value,
@@ -1165,6 +1174,7 @@ async function refresh() {
     document.getElementById('cfgWeekly').checked = !!d.weekly_enabled;
     document.getElementById('cfgDaily').checked = !!d.daily_enabled;
     document.getElementById('cfgActiveHours').checked = !!d.active_hours_only;
+    document.getElementById('cfgTz').value = d.timezone || '';
     document.getElementById('cfgNginxSync').checked = !!d.nginx_sync_enabled;
     document.getElementById('cfgSshUser').value = d.nginx_ssh_user || 'root';
     document.getElementById('cfgSshHost').value = d.nginx_ssh_host || '';

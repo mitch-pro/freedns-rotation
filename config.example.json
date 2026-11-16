@@ -55,5 +55,6 @@
   "doc_webapp_url": "",
   "doc_auth_password": "",
   "doc_emails": [],
-  "doc_publish_interval_seconds": 3600
+  "doc_publish_interval_seconds": 3600,
+  "timezone": ""
 }

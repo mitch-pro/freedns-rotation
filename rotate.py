@@ -19,6 +19,7 @@ import secrets
 import signal
 import socket
 import ssl
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import subprocess
 import sys
 import time
@@ -69,11 +70,27 @@ def _parse_hhmm(value: str) -> tuple[int, int]:
     return int(hh), int(mm)
 
 
+def resolve_timezone(config: dict[str, Any]) -> ZoneInfo | None:
+    """tzinfo for the configured `timezone` (e.g. 'America/Los_Angeles'), or None for system local."""
+    name = str(config.get("timezone", "")).strip()
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def _to_local(dt: datetime, config: dict[str, Any]) -> datetime:
+    """Convert an aware datetime to the configured active-hours timezone (system local if unset/invalid)."""
+    return dt.astimezone(resolve_timezone(config))
+
+
 def is_in_active_hours(dt: datetime, config: dict[str, Any]) -> bool:
     """Return True if rotation is allowed at dt (respecting active_hours_only & weekends)."""
     if not config.get("active_hours_only", False):
         return True
-    local_dt = dt.astimezone()
+    local_dt = _to_local(dt, config)
     if local_dt.weekday() >= 5:
         return False
     sh, sm = _parse_hhmm(str(config.get("active_hours_start", "08:30")))
@@ -87,7 +104,7 @@ def next_active_window_start(dt: datetime, config: dict[str, Any]) -> datetime:
     """Return the next UTC timestamp where active hours allow rotation."""
     if not config.get("active_hours_only", False):
         return dt
-    local_dt = dt.astimezone()
+    local_dt = _to_local(dt, config)
     sh, sm = _parse_hhmm(str(config.get("active_hours_start", "08:30")))
     eh, em = _parse_hhmm(str(config.get("active_hours_end", "15:20")))
 
@@ -156,7 +173,7 @@ def fqdn_exists_in_dns(fqdn: str) -> bool:
 
 def get_interval_seconds(dt: datetime, config: dict[str, Any]) -> float:
     wkday, wkend = sync_rotation_rates(config)
-    local_dt = dt.astimezone()
+    local_dt = _to_local(dt, config)
     is_weekend = local_dt.weekday() >= 5
     rotations = float(wkend if is_weekend else wkday)
     rotations = max(0.01, rotations)
@@ -179,7 +196,7 @@ def _advance_active_time(dt: datetime, seconds: float, config: dict[str, Any]) -
     t = next_active_window_start(dt, config)
     remaining = seconds
     for _ in range(10000):
-        local = t.astimezone()
+        local = _to_local(t, config)
         window_end = local.replace(hour=eh, minute=em, second=0, microsecond=0).astimezone(timezone.utc)
         available = (window_end - t).total_seconds()
         if remaining < available:
