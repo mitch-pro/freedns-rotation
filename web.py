@@ -19,6 +19,7 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from doc import get_current_url, normalize_emails as normalize_emails_doc, publish_domains
 from freedns_client import AuthenticationError, FreeDNSClient
 from rotate import (
     advance_rotation_time,
@@ -212,6 +213,7 @@ class RotatorController:
         self._last_error: str | None = None
         self._cached_target_ip: str = "unresolved"
         self._cached_target_ip_at: float = 0.0
+        self._doc_url: str = ""
 
         now = utc_now()
         self.next_rot = (
@@ -262,12 +264,17 @@ class RotatorController:
     def _loop(self) -> None:
         last_dns_check = 0.0
         last_rules_check = 0.0
+        last_doc_publish = 0.0
         while True:
             with self.lock:
                 should_run = self.running
                 has_pending_dns = any(not d.get("working") for d in self.state["active_domains"])
                 rules_enabled = bool(self.config.get("rules_sync_enabled", True))
                 rules_interval = float(self.config.get("rules_check_interval_seconds", 300))
+                doc_enabled = bool(self.config.get("doc_publish_enabled", False))
+                doc_interval = float(self.config.get("doc_publish_interval_seconds", 3600))
+                doc_ready = bool(str(self.config.get("doc_webapp_url", "")).strip())
+                has_working = any(d.get("working") for d in self.state["active_domains"])
 
             now_mono = time.monotonic()
             if rules_enabled and (now_mono - last_rules_check) >= rules_interval:
@@ -276,6 +283,13 @@ class RotatorController:
                     self.sync_rules()
                 except Exception as exc:
                     self.log(f"Rules check error: {exc}")
+
+            if doc_enabled and doc_ready and has_working and (now_mono - last_doc_publish) >= doc_interval:
+                last_doc_publish = now_mono
+                try:
+                    self.publish_doc()
+                except Exception as exc:
+                    self.log(f"Doc publish error: {exc}")
 
             if has_pending_dns and (now_mono - last_dns_check) >= 30.0:
                 last_dns_check = now_mono
@@ -494,6 +508,28 @@ class RotatorController:
             self.log(f"Rules sync: {len(words)} *word* prefixes, rotated {len(rotated)} blocked domain(s).")
             return len(words), len(rotated)
 
+    def publish_doc(self) -> dict[str, Any]:
+        """Publish the current working domains + expiry to the Google Doc web app."""
+        with self.lock:
+            now = utc_now()
+            active = sorted(self.state["active_domains"], key=lambda d: d["created_at"])
+            reps = compute_replacement_times(active, self.next_rot, self.config)
+            domains = []
+            for entry, rep in zip(active, reps):
+                if not entry.get("working"):
+                    continue
+                domains.append({
+                    "fqdn": entry["fqdn"],
+                    "expires_at": rep.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "expires_in": format_duration((rep - now).total_seconds()),
+                })
+            config = dict(self.config)
+        result = publish_domains(config, domains)  # network call runs outside the lock
+        url = str(result.get("url", ""))
+        self._doc_url = url
+        self.log(f"Published {len(domains)} working domain(s) to Google Doc" + (f": {url}" if url else "."))
+        return {"published": len(domains), "url": url}
+
     def verify_sync(self) -> dict[str, Any]:
         """Check every verified-working domain serves valid HTTPS; sync if any don't."""
         with self.lock:
@@ -554,6 +590,18 @@ class RotatorController:
                 self.config["word_list"] = words
             if "banned_domains" in updates:
                 self.config["banned_domains"] = normalize_banned_domains(updates["banned_domains"])
+            if "doc_publish_enabled" in updates:
+                self.config["doc_publish_enabled"] = bool(updates["doc_publish_enabled"])
+            if "doc_webapp_url" in updates:
+                self.config["doc_webapp_url"] = str(updates["doc_webapp_url"]).strip()
+            if "doc_emails" in updates:
+                self.config["doc_emails"] = normalize_emails_doc(updates["doc_emails"])
+            if "doc_publish_interval_seconds" in updates:
+                self.config["doc_publish_interval_seconds"] = max(60, int(updates["doc_publish_interval_seconds"]))
+            if "doc_auth_password" in updates:
+                pw = str(updates["doc_auth_password"])
+                if pw:  # only overwrite the stored secret when a new one is supplied
+                    self.config["doc_auth_password"] = pw
 
             # Persist config without overwriting env-only secrets if empty.
             with self.config_path.open("w", encoding="utf-8") as f:
@@ -635,6 +683,12 @@ class RotatorController:
                 "weekend_rotations_per_day": float(self.config["weekend_rotations_per_day"]),
                 "word_list": self.config.get("word_list", []),
                 "banned_domains": normalize_banned_domains(self.config.get("banned_domains", [])),
+                "doc_publish_enabled": bool(self.config.get("doc_publish_enabled", False)),
+                "doc_webapp_url": str(self.config.get("doc_webapp_url", "")),
+                "doc_emails": normalize_emails_doc(self.config.get("doc_emails", [])),
+                "doc_auth_password_set": bool(str(self.config.get("doc_auth_password", ""))),
+                "doc_publish_interval_seconds": int(self.config.get("doc_publish_interval_seconds", 3600)),
+                "doc_current_url": self._doc_url,
                 "next_rotation_at": self.next_rot.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "next_rotation_in": format_duration((self.next_rot - now).total_seconds()),
                 "active_count": len(active_rows),
@@ -799,6 +853,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <button id="syncRulesBtn" onclick="syncRules()">Check Rules Now</button>
     <button onclick="api('/api/sync-nginx')">Sync Nginx &amp; Certbot</button>
     <button id="verifySyncBtn" onclick="verifySync()">Verify Nginx &amp; Certbot</button>
+    <button id="publishDocBtn" onclick="publishDoc()">Publish Google Doc</button>
     <button class="danger" onclick="clearAll()">Clear ALL Domains</button>
   </div>
 
@@ -816,6 +871,9 @@ HTML_PAGE = """<!DOCTYPE html>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
         <input id="cfgNginxSync" type="checkbox" style="width:auto;margin:0;"> Auto-Sync Nginx &amp; Certbot (SSH)
       </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+        <input id="cfgDocPublish" type="checkbox" style="width:auto;margin:0;"> Auto-Publish Working Domains to Google Doc
+      </label>
     </div>
     <div class="settings-grid">
       <div><label class="label">Speed Multiplier (1 = real-time)<input id="cfgSpeed" type="number" step="any"></label></div>
@@ -826,6 +884,10 @@ HTML_PAGE = """<!DOCTYPE html>
       <div><label class="label">GoGuardian Interface<input id="cfgGgInterface" type="text" placeholder="eth1 (default route if blank)"></label></div>
       <div style="grid-column: span 2;"><label class="label">Word List (comma-separated)<input id="cfgWords" type="text"></label></div>
       <div style="grid-column: span 2;"><label class="label">Banned Domains (comma-separated; also bans subdomains)<input id="cfgBanned" type="text" placeholder="groups.id, example.com"></label></div>
+      <div style="grid-column: span 2;"><label class="label">Doc Web App URL (Apps Script /exec)<input id="cfgDocUrl" type="text" placeholder="https://script.google.com/macros/s/.../exec"></label></div>
+      <div><label class="label">Doc Auth Password<input id="cfgDocPw" type="password" placeholder="(unchanged)" autocomplete="new-password"></label></div>
+      <div><label class="label">Doc Publish Interval (sec)<input id="cfgDocInterval" type="number" min="60" placeholder="3600"></label></div>
+      <div style="grid-column: span 2;"><label class="label">Doc Share Emails (comma-separated)<input id="cfgDocEmails" type="text" placeholder="a@example.com, b@example.com"></label></div>
       <div><button class="primary" style="width:100%" onclick="saveConfig()">Save Settings</button></div>
     </div>
   </div>
@@ -926,6 +988,18 @@ async function verifySync() {
   } finally { btn.disabled = false; btn.textContent = label; }
 }
 
+async function publishDoc() {
+  const btn = document.getElementById('publishDocBtn');
+  btn.disabled = true; const label = btn.textContent; btn.textContent = 'Publishing...';
+  try {
+    const d = await api('/api/publish-doc');
+    if (d.error) return;
+    let msg = `Published ${d.published} working domain(s) to a new Google Doc.`;
+    if (d.url) msg += `\n\n${d.url}`;
+    alert(msg);
+  } finally { btn.disabled = false; btn.textContent = label; }
+}
+
 async function clearAll() {
   if (!confirm('Delete EVERY subdomain on your FreeDNS account? This cannot be undone.')) return;
   await api('/api/clear-all');
@@ -944,8 +1018,14 @@ async function saveConfig() {
     speed_multiplier: parseFloat(document.getElementById('cfgSpeed').value),
     max_domains: parseInt(document.getElementById('cfgMax').value, 10),
     word_list: document.getElementById('cfgWords').value,
-    banned_domains: document.getElementById('cfgBanned').value
+    banned_domains: document.getElementById('cfgBanned').value,
+    doc_publish_enabled: document.getElementById('cfgDocPublish').checked,
+    doc_webapp_url: document.getElementById('cfgDocUrl').value,
+    doc_emails: document.getElementById('cfgDocEmails').value,
+    doc_publish_interval_seconds: parseInt(document.getElementById('cfgDocInterval').value || '3600', 10),
+    doc_auth_password: document.getElementById('cfgDocPw').value
   });
+  document.getElementById('cfgDocPw').value = '';
   cfgLoaded = false;
 }
 
@@ -1066,6 +1146,11 @@ async function refresh() {
     document.getElementById('cfgMax').value = d.max_domains;
     document.getElementById('cfgWords').value = d.word_list.join(', ');
     document.getElementById('cfgBanned').value = (d.banned_domains || []).join(', ');
+    document.getElementById('cfgDocPublish').checked = !!d.doc_publish_enabled;
+    document.getElementById('cfgDocUrl').value = d.doc_webapp_url || '';
+    document.getElementById('cfgDocEmails').value = (d.doc_emails || []).join(', ');
+    document.getElementById('cfgDocInterval').value = d.doc_publish_interval_seconds || 3600;
+    document.getElementById('cfgDocPw').placeholder = d.doc_auth_password_set ? '(unchanged — set)' : '(not set)';
     cfgLoaded = true;
   }
 
@@ -1460,6 +1545,8 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
                     self._send_json(HTTPStatus.OK, {"ok": True, "added": added, "total": total})
                 elif path == "/api/verify-sync":
                     self._send_json(HTTPStatus.OK, {"ok": True, **controller.verify_sync()})
+                elif path == "/api/publish-doc":
+                    self._send_json(HTTPStatus.OK, {"ok": True, **controller.publish_doc()})
                 elif path == "/api/sync-nginx":
                     controller.sync_nginx()
                     self._send_json(HTTPStatus.OK, {"ok": True})

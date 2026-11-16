@@ -77,3 +77,12 @@ sudo loginctl enable-linger mitch
 ### Verify Nginx & Certbot
 The **Verify Nginx & Certbot** button opens an HTTPS connection to the nginx server for every verified-working domain (SNI = the domain) and fully validates the certificate (trusted chain, hostname, expiry). If any fail it runs a sync, then re-checks those and reports what is still broken. Checks go to `nginx_check_host` if set, else `nginx_ssh_host`, else the IP of `target_domain` (set `nginx_check_host` to the server's LAN IP if your router doesn't do hairpin NAT).
 
+
+## Google Doc Publisher (`doc.py` + `google_doc_publisher.gs`)
+Publishes the current working domains and their expiry times to a Google Doc. The Apps Script creates a **new** doc each publish, shares it with a list of emails, marks it current, and trashes the docs it made before (rotating the shareable URL each time).
+
+1. In `script.google.com`, create a project and paste `google_doc_publisher.gs`.
+2. Deploy → New deployment → **Web app**, *Execute as* Me, *Who has access* **Anyone**. Copy the `/exec` URL.
+3. In the web UI settings set **Doc Web App URL**, **Doc Auth Password** (shared secret; the first request sets it on the script if unset), **Doc Share Emails**, optionally **Doc Publish Interval**, and tick **Auto-Publish** (or use the **Publish Google Doc** button).
+
+Secrets (`doc_auth_password`) live in `config.json` and are never returned by the UI; the password field stays blank and only overwrites when you type a new value. Note: a school/Workspace Google account may block "Anyone" web-app access or external link-sharing — deploy from an account whose admin allows it.
