@@ -19,7 +19,12 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from doc import get_current_url, normalize_emails as normalize_emails_doc, publish_domains
+from doc import (
+    doc_id_match_targets,
+    get_current_url,
+    normalize_emails as normalize_emails_doc,
+    publish_domains,
+)
 from freedns_client import AuthenticationError, FreeDNSClient
 from rotate import (
     advance_rotation_time,
@@ -214,6 +219,7 @@ class RotatorController:
         self._cached_target_ip: str = "unresolved"
         self._cached_target_ip_at: float = 0.0
         self._doc_url: str = ""
+        self._doc_block_url: str = ""  # doc URL we last republished after a GoGuardian block
 
         now = utc_now()
         self.next_rot = (
@@ -506,7 +512,29 @@ class RotatorController:
                 target_ip = resolve_target_ip(self.config["target_domain"])
                 self._persist(target_ip)
             self.log(f"Rules sync: {len(words)} *word* prefixes, rotated {len(rotated)} blocked domain(s).")
-            return len(words), len(rotated)
+
+            # If our current published Google Doc is now blocked (doc-specific match),
+            # republish once to get a fresh URL. Detect under the lock; publish after.
+            doc_block_rule = None
+            cur_doc = self._doc_url
+            if cur_doc and compiled_blocks and cur_doc != self._doc_block_url:
+                for target in doc_id_match_targets(cur_doc):
+                    hit = is_fqdn_blocked(target, compiled_blocks, compiled_allows)
+                    if hit:
+                        doc_block_rule = hit
+                        break
+            result = (len(words), len(rotated))
+
+        if doc_block_rule:
+            self.log(f"Current Google Doc appears blocked by rule {doc_block_rule!r}; publishing a new doc.")
+            try:
+                self.publish_doc()
+            except Exception as exc:
+                self.log(f"Doc republish error: {exc}")
+            # Record the URL we reacted to (new one on success, old on failure) so a
+            # domain-wide or /document/* block can't trigger an endless republish loop.
+            self._doc_block_url = self._doc_url
+        return result
 
     def publish_doc(self) -> dict[str, Any]:
         """Publish the current working domains + expiry to the Google Doc web app."""

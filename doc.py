@@ -66,6 +66,34 @@ def render_document_text(domains: list[dict[str, Any]], target_domain: str = "")
     return "\n".join(lines)
 
 
+def _strip_scheme(url: str) -> str:
+    u = url.strip().lower()
+    for scheme in ("https://", "http://"):
+        if u.startswith(scheme):
+            return u[len(scheme):]
+    return u
+
+
+def doc_id_match_targets(url: str) -> list[str]:
+    """Doc-specific strings to test a current doc URL against GoGuardian site patterns.
+
+    Returns only id/path-specific candidates (never the bare host), so that a
+    domain-wide block of docs.google.com does NOT trigger a pointless republish —
+    a fresh doc lives on the same host and would be blocked just the same.
+    """
+    u = _strip_scheme(url).rstrip("/")
+    if "/" not in u:
+        return []
+    host = u.split("/", 1)[0]
+    targets = [u]
+    m = re.search(r"/document/d/([a-z0-9_-]+)", u)
+    if m:
+        specific = f"{host}/document/d/{m.group(1)}"
+        if specific not in targets:
+            targets.append(specific)
+    return targets
+
+
 def build_payload(config: dict[str, Any], domains: list[dict[str, Any]]) -> dict[str, Any]:
     target = str(config.get("target_domain", "")).strip()
     title = str(config.get("doc_title_prefix", "Working Domains")).strip() or "Working Domains"
