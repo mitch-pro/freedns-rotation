@@ -1,9 +1,13 @@
 /**
  * FreeDNS domain publisher — Google Apps Script web app.
  *
- * Pairs with doc.py. On each POST it creates a NEW Google Doc containing the
- * current working domains and their expiry times, shares it with the supplied
- * emails, records it as the current doc, and trashes the docs it created before.
+ * Pairs with doc.py. Each POST carries a `mode`:
+ *   "update" (default) — rewrite the CURRENT doc in place (same URL, no sharing,
+ *                        so nobody gets an email). If there is no current doc it
+ *                        creates one, unless `allow_new` is false (then it skips).
+ *   "new"              — create a NEW doc, share it with the supplied emails
+ *                        (this is what emails people), make it current, and
+ *                        trash the docs created before.
  *
  * ── Setup ────────────────────────────────────────────────────────────────────
  * 1. script.google.com → New project → paste this file in.
@@ -34,41 +38,75 @@ function doPost(e) {
     var title = String(body.title || ('Domains ' + new Date().toISOString()));
     var text = String(body.text || '');
     var emails = (body.emails || []).filter(function (x) { return x; });
+    var mode = String(body.mode || 'update');
 
-    // 1. Create the new doc and write the body.
-    var doc = DocumentApp.create(title);
-    var b = doc.getBody();
-    b.clear();
-    b.appendParagraph(text).setFontFamily('Courier New');
-    doc.saveAndClose();
-
-    var id = doc.getId();
-    var file = DriveApp.getFileById(id);
-
-    // 2. Share. Link-sharing may be blocked by a Workspace admin; don't let that
-    //    stop the per-email sharing, so guard each call independently.
-    try {
-      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-    } catch (err) { /* link sharing disabled by policy */ }
-    emails.forEach(function (addr) {
-      try { file.addViewer(addr); } catch (err) { /* e.g. external sharing blocked */ }
-    });
-
-    // 3. Trash the docs we published before, then record this as current.
-    var prev = [];
-    try { prev = JSON.parse(PROP.getProperty('DOC_IDS') || '[]'); } catch (err) { prev = []; }
-    prev.forEach(function (oldId) {
-      if (oldId && oldId !== id) {
-        try { DriveApp.getFileById(oldId).setTrashed(true); } catch (err) {}
+    if (mode !== 'new') {
+      var curId = PROP.getProperty('CURRENT_ID') || '';
+      var cur = curId ? openCurrent_(curId) : null;
+      if (cur) {
+        writeBody_(cur, text);
+        cur.setName(title);
+        var curUrl = cur.getUrl();
+        cur.saveAndClose();
+        return json_({ ok: true, id: curId, url: curUrl, created: false, shared: 0 });
       }
-    });
-    PROP.setProperty('DOC_IDS', JSON.stringify([id]));
-    PROP.setProperty('CURRENT_ID', id);
-
-    return json_({ ok: true, id: id, url: doc.getUrl(), shared: emails.length });
+      if (body.allow_new === false) {
+        return json_({ ok: true, skipped: true, created: false, shared: 0, url: '' });
+      }
+    }
+    return json_(createAndShare_(title, text, emails));
   } catch (err) {
     return json_({ ok: false, error: String(err) });
   }
+}
+
+// Open the current doc, or null if it was deleted / trashed / inaccessible.
+function openCurrent_(id) {
+  try {
+    if (DriveApp.getFileById(id).isTrashed()) return null;
+    return DocumentApp.openById(id);
+  } catch (err) {
+    return null;
+  }
+}
+
+function writeBody_(doc, text) {
+  var b = doc.getBody();
+  b.clear();
+  b.appendParagraph(text).setFontFamily('Courier New');
+}
+
+function createAndShare_(title, text, emails) {
+  // 1. Create the new doc and write the body.
+  var doc = DocumentApp.create(title);
+  writeBody_(doc, text);
+  var id = doc.getId();
+  var url = doc.getUrl();
+  doc.saveAndClose();
+
+  var file = DriveApp.getFileById(id);
+
+  // 2. Share. Link-sharing may be blocked by a Workspace admin; don't let that
+  //    stop the per-email sharing, so guard each call independently.
+  try {
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  } catch (err) { /* link sharing disabled by policy */ }
+  emails.forEach(function (addr) {
+    try { file.addViewer(addr); } catch (err) { /* e.g. external sharing blocked */ }
+  });
+
+  // 3. Trash the docs we published before, then record this as current.
+  var prev = [];
+  try { prev = JSON.parse(PROP.getProperty('DOC_IDS') || '[]'); } catch (err) { prev = []; }
+  prev.forEach(function (oldId) {
+    if (oldId && oldId !== id) {
+      try { DriveApp.getFileById(oldId).setTrashed(true); } catch (err) {}
+    }
+  });
+  PROP.setProperty('DOC_IDS', JSON.stringify([id]));
+  PROP.setProperty('CURRENT_ID', id);
+
+  return { ok: true, id: id, url: url, created: true, shared: emails.length };
 }
 
 // GET ?password=<secret> → the current doc's URL (used by doc.get_current_url).

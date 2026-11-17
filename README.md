@@ -86,10 +86,13 @@ The **Verify Nginx & Certbot** button opens an HTTPS connection to the nginx ser
 
 
 ## Google Doc Publisher (`doc.py` + `google_doc_publisher.gs`)
-Publishes the current working domains and their expiry times to a Google Doc. The Apps Script creates a **new** doc each publish, shares it with a list of emails, marks it current, and trashes the docs it made before (rotating the shareable URL each time).
+Publishes the current working domains and their expiry times to a Google Doc.
+- **Routine publishes** (auto-publish interval, **Update Google Doc** button) rewrite the current doc in place: same URL, no sharing, so nobody gets emailed.
+- **A new doc is created and shared** (emailing the list), and the old docs trashed, only when there is no current doc yet, when GoGuardian blocks the current doc, or when you click **New Google Doc + Reshare**.
+- With **Active Hours Only** on, automatic new docs and shares wait until the next active-hours window. A manual **New Google Doc + Reshare** click goes out immediately.
 
-1. In `script.google.com`, create a project and paste `google_doc_publisher.gs`.
+1. In `script.google.com`, create a project and paste `google_doc_publisher.gs`. After updating the file, paste it again and redeploy a new version (Manage deployments → edit → New version), or the old script keeps creating and sharing a new doc on every publish.
 2. Deploy → New deployment → **Web app**, *Execute as* Me, *Who has access* **Anyone**. Copy the `/exec` URL.
-3. In the web UI settings set **Doc Web App URL**, **Doc Auth Password** (shared secret; the first request sets it on the script if unset), **Doc Share Emails**, optionally **Doc Publish Interval**, and tick **Auto-Publish** (or use the **Publish Google Doc** button).
+3. In the web UI settings set **Doc Web App URL**, **Doc Auth Password** (shared secret; the first request sets it on the script if unset), **Doc Share Emails**, optionally **Doc Publish Interval**, and tick **Auto-Publish** (or use the **Update Google Doc** button).
 
 Secrets (`doc_auth_password`) live in `config.json` and are never returned by the UI; the password field stays blank and only overwrites when you type a new value. Note: a school/Workspace Google account may block "Anyone" web-app access or external link-sharing — deploy from an account whose admin allows it.

@@ -2,9 +2,10 @@
 """Publish the current working FreeDNS domains (and their expiry times) to a
 Google Doc via a Google Apps Script web app (see google_doc_publisher.gs).
 
-The Apps Script creates a brand-new Google Doc each time, shares it with a list
-of emails, records it as the "current" doc, and trashes the docs it created
-before. Rotating the doc this way gives a fresh, shareable URL on every publish.
+Routine publishes rewrite the current doc in place (same URL, no sharing, so no
+emails). Only a "new" publish creates a fresh doc, shares it with the email list,
+records it as current, and trashes the docs it created before — used when there
+is no doc yet, the current one is blocked, or on request.
 
 Nothing here is FreeDNS-specific beyond the payload shape: the controller hands
 us a list of {"fqdn", "expires_at", "expires_in"} dicts plus the config, and we
@@ -143,15 +144,24 @@ def publish_domains(
     config: dict[str, Any],
     domains: list[dict[str, Any]],
     *,
+    new_doc: bool = False,
+    allow_new: bool = True,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
-    """POST the domains to the web app. Returns the parsed response (with 'url', 'id')."""
+    """POST the domains to the web app. Returns the parsed response (with 'url', 'id', 'created').
+
+    new_doc=False rewrites the current doc in place (no sharing, no emails); new_doc=True
+    creates + shares a fresh doc. allow_new=False stops an update from creating the first doc.
+    """
     url = str(config.get("doc_webapp_url", "")).strip()
     if not url:
         raise RuntimeError("doc_webapp_url is not configured")
     if not str(config.get("doc_auth_password", "")):
         raise RuntimeError("doc_auth_password is not configured")
-    return _post_json(url, build_payload(config, domains), timeout)
+    payload = build_payload(config, domains)
+    payload["mode"] = "new" if new_doc else "update"
+    payload["allow_new"] = bool(allow_new)
+    return _post_json(url, payload, timeout)
 
 
 def get_current_url(config: dict[str, Any], *, timeout: float = 20.0) -> str:

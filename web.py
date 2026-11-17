@@ -227,6 +227,7 @@ class RotatorController:
         self._cached_target_ip_at: float = 0.0
         self._doc_url: str = ""
         self._doc_block_url: str = ""  # doc URL we last republished after a GoGuardian block
+        self._doc_pending_new: bool = False  # new doc (+ share emails) deferred to active hours
 
         now = utc_now()
         self.next_rot = (
@@ -288,6 +289,7 @@ class RotatorController:
                 doc_interval = float(self.config.get("doc_publish_interval_seconds", 3600))
                 doc_ready = bool(str(self.config.get("doc_webapp_url", "")).strip())
                 has_working = any(d.get("working") for d in self.state["active_domains"])
+                doc_pending_new = self._doc_pending_new and is_in_active_hours(utc_now(), self.config)
 
             now_mono = time.monotonic()
             if rules_enabled and (now_mono - last_rules_check) >= rules_interval:
@@ -297,10 +299,17 @@ class RotatorController:
                 except Exception as exc:
                     self.log(f"Rules check error: {exc}")
 
-            if doc_enabled and doc_ready and has_working and (now_mono - last_doc_publish) >= doc_interval:
+            if doc_ready and doc_pending_new:
                 last_doc_publish = now_mono
                 try:
-                    self.publish_doc()
+                    self.log("Active hours started; creating the deferred new Google Doc.")
+                    self.publish_doc(new_doc=True)
+                except Exception as exc:
+                    self.log(f"Doc publish error: {exc}")
+            elif doc_enabled and doc_ready and has_working and (now_mono - last_doc_publish) >= doc_interval:
+                last_doc_publish = now_mono
+                try:
+                    self.publish_doc()  # in-place update: no sharing, no emails
                 except Exception as exc:
                     self.log(f"Doc publish error: {exc}")
 
@@ -537,7 +546,7 @@ class RotatorController:
         if doc_block_rule:
             self.log(f"Current Google Doc appears blocked by rule {doc_block_rule!r}; publishing a new doc.")
             try:
-                self.publish_doc()
+                self.publish_doc(new_doc=True)
             except Exception as exc:
                 self.log(f"Doc republish error: {exc}")
             # Record the URL we reacted to (new one on success, old on failure) so a
@@ -545,10 +554,20 @@ class RotatorController:
             self._doc_block_url = self._doc_url
         return result
 
-    def publish_doc(self) -> dict[str, Any]:
-        """Publish the current working domains + expiry to the Google Doc web app."""
+    def publish_doc(self, new_doc: bool = False, manual: bool = False) -> dict[str, Any]:
+        """Publish the working domains + expiry to the Google Doc web app.
+
+        Default: rewrite the current doc in place (no sharing, no emails). new_doc=True creates
+        and shares a fresh doc. With active_hours_only on, creating/sharing only happens inside
+        active hours (deferred otherwise) unless triggered manually.
+        """
         with self.lock:
             now = utc_now()
+            allow_new = manual or is_in_active_hours(now, self.config)
+            if new_doc and not allow_new:
+                self._doc_pending_new = True
+                self.log("Outside active hours; new Google Doc (and sharing) deferred until active hours.")
+                return {"published": 0, "url": self._doc_url, "created": False, "deferred": True}
             active = sorted(self.state["active_domains"], key=lambda d: d["created_at"])
             reps = compute_replacement_times(active, self.next_rot, self.config)
             domains = []
@@ -561,11 +580,24 @@ class RotatorController:
                     "expires_in": format_duration((rep - now).total_seconds()),
                 })
             config = dict(self.config)
-        result = publish_domains(config, domains)  # network call runs outside the lock
+        # network call runs outside the lock
+        result = publish_domains(config, domains, new_doc=new_doc, allow_new=allow_new)
+        if result.get("skipped"):
+            self._doc_pending_new = True
+            self.log("No Google Doc yet; creating + sharing it is deferred until active hours.")
+            return {"published": 0, "url": "", "created": False, "deferred": True}
         url = str(result.get("url", ""))
+        created = bool(result.get("created", new_doc))
         self._doc_url = url
-        self.log(f"Published {len(domains)} working domain(s) to Google Doc" + (f": {url}" if url else "."))
-        return {"published": len(domains), "url": url}
+        if created:
+            self._doc_pending_new = False
+            self.log(
+                f"Created new Google Doc with {len(domains)} working domain(s), "
+                f"shared with {result.get('shared', 0)} email(s)" + (f": {url}" if url else ".")
+            )
+        else:
+            self.log(f"Updated Google Doc in place with {len(domains)} working domain(s) (no reshare).")
+        return {"published": len(domains), "url": url, "created": created, "deferred": False}
 
     def verify_sync(self) -> dict[str, Any]:
         """Check every verified-working domain serves valid HTTPS; sync if any don't."""
@@ -908,7 +940,8 @@ HTML_PAGE = """<!DOCTYPE html>
     <button id="syncRulesBtn" onclick="syncRules()">Check Rules Now</button>
     <button onclick="api('/api/sync-nginx')">Sync Nginx &amp; Certbot</button>
     <button id="verifySyncBtn" onclick="verifySync()">Verify Nginx &amp; Certbot</button>
-    <button id="publishDocBtn" onclick="publishDoc()">Publish Google Doc</button>
+    <button id="publishDocBtn" onclick="publishDoc(false)">Update Google Doc</button>
+    <button id="newDocBtn" onclick="publishDoc(true)">New Google Doc + Reshare</button>
     <button class="danger" onclick="clearAll()">Clear ALL Domains</button>
   </div>
 
@@ -1049,13 +1082,16 @@ async function verifySync() {
   } finally { btn.disabled = false; btn.textContent = label; }
 }
 
-async function publishDoc() {
-  const btn = document.getElementById('publishDocBtn');
+async function publishDoc(fresh) {
+  if (fresh && !confirm('Create a NEW Google Doc and share it with every email (sends them an email)?')) return;
+  const btn = document.getElementById(fresh ? 'newDocBtn' : 'publishDocBtn');
   btn.disabled = true; const label = btn.textContent; btn.textContent = 'Publishing...';
   try {
-    const d = await api('/api/publish-doc');
+    const d = await api(fresh ? '/api/publish-doc-new' : '/api/publish-doc');
     if (d.error) return;
-    let msg = `Published ${d.published} working domain(s) to a new Google Doc.`;
+    let msg = d.created
+      ? `Created a new Google Doc with ${d.published} working domain(s) and shared it.`
+      : `Updated the Google Doc in place with ${d.published} working domain(s) (no reshare).`;
     if (d.url) msg += `\n\n${d.url}`;
     alert(msg);
   } finally { btn.disabled = false; btn.textContent = label; }
@@ -1615,7 +1651,9 @@ def make_handler(controller: RotatorController, auth: AuthManager) -> type[BaseH
                 elif path == "/api/verify-sync":
                     self._send_json(HTTPStatus.OK, {"ok": True, **controller.verify_sync()})
                 elif path == "/api/publish-doc":
-                    self._send_json(HTTPStatus.OK, {"ok": True, **controller.publish_doc()})
+                    self._send_json(HTTPStatus.OK, {"ok": True, **controller.publish_doc(manual=True)})
+                elif path == "/api/publish-doc-new":
+                    self._send_json(HTTPStatus.OK, {"ok": True, **controller.publish_doc(new_doc=True, manual=True)})
                 elif path == "/api/sync-nginx":
                     controller.sync_nginx()
                     self._send_json(HTTPStatus.OK, {"ok": True})
