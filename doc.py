@@ -53,7 +53,10 @@ def render_document_text(domains: list[dict[str, Any]], target_domain: str = "")
         lines.append("(no working domains right now)")
         return "\n".join(lines)
 
-    lines.append("These links work until the listed expiry time:")
+    if any(d.get("expires_at") for d in domains):
+        lines.append("These links work until the listed expiry time:")
+    else:
+        lines.append("These links work until they get blocked:")
     lines.append("")
     width = max(len(d.get("fqdn", "")) for d in domains)
     for d in domains:

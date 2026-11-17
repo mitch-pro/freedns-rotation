@@ -8,6 +8,7 @@ Automated FreeDNS (`freedns.afraid.org`) subdomain rotator with a password- and 
   - **`weekly_enabled`**: `max_domains` rotations per week (55 → ~9.2/day weekdays, ~4.6/day weekends; ~1 week lifetime).
   - **`daily_enabled`**: `max_domains / 2` rotations per day (55 → 27.5/day; ~2 day lifetime).
   - **`active_hours_only`**: same weekly volume, squeezed into the weekday active-hours window.
+  - **`blocks_only_enabled`** (**Blocks Only** in the UI): no timer rotation at all. A domain is replaced only when the GoGuardian rules sync finds it blocked, and the pool is topped back up to `max_domains` (e.g. after never-verified domains are pruned). Needs `rules_sync_enabled`. CLI: `--blocks-only`.
   - **`active_hours_only`**: only rotates during local hours **08:30–15:20** on weekdays (no rotations on weekends).
 - Draws from **all public domains** in the FreeDNS registry (cached in `registry_cache.json`).
 - Picks subdomain prefixes randomly from `word_list` across public domains, falling back to 1- or 2-word diceware labels when exhausted.

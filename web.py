@@ -40,6 +40,7 @@ from rotate import (
     get_interval_seconds,
     import_account_domains,
     is_fqdn_blocked,
+    blocks_only,
     is_in_active_hours,
     load_config,
     load_state,
@@ -279,6 +280,7 @@ class RotatorController:
         last_dns_check = 0.0
         last_rules_check = 0.0
         last_doc_publish = 0.0
+        last_fill_check = 0.0
         while True:
             with self.lock:
                 should_run = self.running
@@ -320,7 +322,22 @@ class RotatorController:
                 except Exception:
                     pass
 
-            if should_run:
+            if should_run and blocks_only(self.config):
+                # No timer rotation: blocked domains are replaced by sync_rules; just keep
+                # the pool at max_domains (e.g. after never-verified domains get pruned).
+                if (time.monotonic() - last_fill_check) >= 60.0:
+                    last_fill_check = time.monotonic()
+                    with self.lock:
+                        short = len(self.state["active_domains"]) < int(self.config["max_domains"])
+                    if short:
+                        try:
+                            self.fill_all()
+                            last_dns_check = time.monotonic()
+                        except Exception as exc:
+                            with self.lock:
+                                self._last_error = str(exc)
+                            self.log(f"Blocks-only fill error: {exc}")
+            elif should_run:
                 now = utc_now()
                 if now >= self.next_rot:
                     with self.lock:
@@ -574,10 +591,11 @@ class RotatorController:
             for entry, rep in zip(active, reps):
                 if not entry.get("working"):
                     continue
+                bo = blocks_only(self.config)  # no scheduled expiry in blocks-only mode
                 domains.append({
                     "fqdn": entry["fqdn"],
-                    "expires_at": rep.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                    "expires_in": format_duration((rep - now).total_seconds()),
+                    "expires_at": "" if bo else rep.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "expires_in": "" if bo else format_duration((rep - now).total_seconds()),
                 })
             config = dict(self.config)
         # network call runs outside the lock
@@ -633,6 +651,8 @@ class RotatorController:
                 self.config["daily_enabled"] = bool(updates["daily_enabled"])
             if "active_hours_only" in updates:
                 self.config["active_hours_only"] = bool(updates["active_hours_only"])
+            if "blocks_only_enabled" in updates:
+                self.config["blocks_only_enabled"] = bool(updates["blocks_only_enabled"])
             if "timezone" in updates:
                 tz = str(updates["timezone"]).strip()
                 self.config["timezone"] = tz
@@ -714,14 +734,15 @@ class RotatorController:
 
             active_rows = []
             working_rows = []
+            bo = blocks_only(self.config)
             for entry, rep in zip(active, replacements):
-                delta = format_duration((rep - now).total_seconds())
+                delta = "-" if bo else format_duration((rep - now).total_seconds())
                 row = {
                     "fqdn": entry["fqdn"],
                     "data_id": entry.get("data_id", ""),
                     "address": entry.get("address", ""),
                     "created_at": parse_iso(entry["created_at"]).strftime("%Y-%m-%d %H:%M:%S UTC"),
-                    "replace_at": rep.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "replace_at": "on block" if bo else rep.strftime("%Y-%m-%d %H:%M:%S UTC"),
                     "replace_in": delta,
                     "working": bool(entry.get("working")),
                     "verified_at": (
@@ -776,8 +797,9 @@ class RotatorController:
                 "doc_auth_password_set": bool(str(self.config.get("doc_auth_password", ""))),
                 "doc_publish_interval_seconds": int(self.config.get("doc_publish_interval_seconds", 3600)),
                 "doc_current_url": self._doc_url,
-                "next_rotation_at": self.next_rot.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "next_rotation_in": format_duration((self.next_rot - now).total_seconds()),
+                "next_rotation_at": "only when GoGuardian blocks a domain" if bo else self.next_rot.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "next_rotation_in": "On block" if bo else format_duration((self.next_rot - now).total_seconds()),
+                "blocks_only_enabled": bo,
                 "active_count": len(active_rows),
                 "working_count": len(working_rows),
                 "old_count": len(self.state["old_domains"]),
@@ -953,6 +975,9 @@ HTML_PAGE = """<!DOCTYPE html>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
         <input id="cfgDaily" type="checkbox" style="width:auto;margin:0;"> Daily / 2-Day (28/day wkday, 27/day wkend)
       </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;" title="Never rotate on a timer. Domains are only replaced when GoGuardian blocks them (and topped back up to Max Domains).">
+        <input id="cfgBlocksOnly" type="checkbox" style="width:auto;margin:0;"> Blocks Only (rotate only when GoGuardian blocks)
+      </label>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
         <input id="cfgActiveHours" type="checkbox" style="width:auto;margin:0;"> Active Hours Only (08:30–15:20, no weekends)
       </label>
@@ -1107,6 +1132,7 @@ async function saveConfig() {
     weekly_enabled: document.getElementById('cfgWeekly').checked,
     daily_enabled: document.getElementById('cfgDaily').checked,
     active_hours_only: document.getElementById('cfgActiveHours').checked,
+    blocks_only_enabled: document.getElementById('cfgBlocksOnly').checked,
     timezone: document.getElementById('cfgTz').value,
     target_enabled: document.getElementById('cfgTargetEnabled').checked,
     target_domain: document.getElementById('cfgTargetDomain').value,
@@ -1238,6 +1264,7 @@ async function refresh() {
     document.getElementById('cfgWeekly').checked = !!d.weekly_enabled;
     document.getElementById('cfgDaily').checked = !!d.daily_enabled;
     document.getElementById('cfgActiveHours').checked = !!d.active_hours_only;
+    document.getElementById('cfgBlocksOnly').checked = !!d.blocks_only_enabled;
     document.getElementById('cfgTz').value = d.timezone || '';
     document.getElementById('cfgTargetEnabled').checked = !!d.target_enabled;
     document.getElementById('cfgTargetDomain').value = d.target_domain_raw || '';

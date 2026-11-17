@@ -65,6 +65,11 @@ def sync_rotation_rates(config: dict[str, Any]) -> tuple[float, float]:
     return wkday, wkend
 
 
+def blocks_only(config: dict[str, Any]) -> bool:
+    """True when domains are never rotated on a timer, only replaced when GoGuardian blocks them."""
+    return bool(config.get("blocks_only_enabled", False))
+
+
 def _parse_hhmm(value: str) -> tuple[int, int]:
     hh, mm = value.strip().split(":", 1)
     return int(hh), int(mm)
@@ -353,6 +358,13 @@ def write_old_domains_file(old_path: Path, old_domains: list[dict[str, Any]]) ->
     old_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def replacement_text(replace_at: datetime, now: datetime, config: dict[str, Any]) -> tuple[str, str]:
+    """(replace-at, replace-in) display strings; blocks-only mode has no scheduled replacement."""
+    if blocks_only(config):
+        return "on block", "-"
+    return replace_at.strftime("%Y-%m-%d %H:%M:%S"), format_duration((replace_at - now).total_seconds())
+
+
 def write_active_domains_file(
     active_path: Path,
     state: dict[str, Any],
@@ -370,11 +382,19 @@ def write_active_domains_file(
         f"# Updated:       {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
         f"# Target A IP:   {target_ip or 'unknown'} ({target_label(config)})",
         f"# Active Count:  {len(active)} / {config['max_domains']}",
-        f"# Schedule:      {config.get('rotation_mode', 'weekly')} "
-        f"({config['weekday_rotations_per_day']}/day weekdays, "
-        f"{config['weekend_rotations_per_day']}/day weekends, speed: {speed:g}x)",
-        f"# Next Rotation: {next_rotation_at.strftime('%Y-%m-%d %H:%M:%S UTC')} "
-        f"(in {format_duration((next_rotation_at - now).total_seconds())})",
+        (
+            "# Schedule:      blocks only (replaced only when GoGuardian blocks a domain)"
+            if blocks_only(config)
+            else f"# Schedule:      {config.get('rotation_mode', 'weekly')} "
+            f"({config['weekday_rotations_per_day']}/day weekdays, "
+            f"{config['weekend_rotations_per_day']}/day weekends, speed: {speed:g}x)"
+        ),
+        (
+            "# Next Rotation: on GoGuardian block"
+            if blocks_only(config)
+            else f"# Next Rotation: {next_rotation_at.strftime('%Y-%m-%d %H:%M:%S UTC')} "
+            f"(in {format_duration((next_rotation_at - now).total_seconds())})"
+        ),
         "",
         f"{'#':<4} {'FQDN':<38} {'Type':<5} {'Target IP':<16} "
         f"{'Created At (UTC)':<21} {'Replace At (UTC)':<21} {'Replace In'}",
@@ -382,8 +402,7 @@ def write_active_domains_file(
     ]
     for idx, (entry, replace_at) in enumerate(zip(active, replacements), start=1):
         created_str = parse_iso(entry["created_at"]).strftime("%Y-%m-%d %H:%M:%S")
-        replace_str = replace_at.strftime("%Y-%m-%d %H:%M:%S")
-        delta = format_duration((replace_at - now).total_seconds())
+        replace_str, delta = replacement_text(replace_at, now, config)
         lines.append(
             f"{idx:<4} {entry['fqdn']:<38} {entry.get('record_type', 'A'):<5} "
             f"{entry['address']:<16} {created_str:<21} {replace_str:<21} {delta}"
@@ -485,8 +504,7 @@ def write_working_domains_file(
             if entry.get("verified_at")
             else "unknown"
         )
-        replace_str = replace_at.strftime("%Y-%m-%d %H:%M:%S")
-        delta = format_duration((replace_at - now).total_seconds())
+        replace_str, delta = replacement_text(replace_at, now, config)
         lines.append(
             f"{idx:<4} {entry['fqdn']:<38} {entry.get('resolved_ip', entry['address']):<16} "
             f"{verified_str:<21} {replace_str:<21} {delta}"
@@ -1159,6 +1177,7 @@ def main() -> int:
     parser.add_argument("--weekly", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable weekly schedule (10/5)")
     parser.add_argument("--daily", action=argparse.BooleanOptionalAction, default=None, help="Enable/disable daily 2-day schedule (28/27)")
     parser.add_argument("--active-hours", action=argparse.BooleanOptionalAction, default=None, help="Only rotate 08:30-15:20 on weekdays")
+    parser.add_argument("--blocks-only", action=argparse.BooleanOptionalAction, default=None, help="Never rotate on a timer; only replace GoGuardian-blocked domains")
     parser.add_argument("--max-domains", type=int, default=None, help=f"Override max_domains (default {DOMAIN_COUNT})")
     parser.add_argument("--once", action="store_true", help="Run one rotation step and exit")
     parser.add_argument("--bootstrap", type=int, default=0, help="Create N subdomains immediately before rotating")
@@ -1185,6 +1204,8 @@ def main() -> int:
         config["speed_multiplier"] = args.speed
     if args.max_domains is not None:
         config["max_domains"] = args.max_domains
+    if args.blocks_only is not None:
+        config["blocks_only_enabled"] = args.blocks_only
 
     state_path = base_dir / config["state_file"]
     active_path = base_dir / config["active_domains_file"]
@@ -1284,6 +1305,24 @@ def main() -> int:
                     print(f"[rules] Synced {len(words)} *word* prefixes; rotated {len(rotated)} blocked domain(s).")
                 except Exception as exc:
                     print(f"[rules] Sync error: {exc}", file=sys.stderr)
+
+            if blocks_only(config):
+                # No timer rotation: blocked domains are replaced by the rules sync above;
+                # here we only prune never-verified domains and top the pool back up to max.
+                try:
+                    prune_unverified_domains(client, state, config)
+                    target_ip, created = fill_to_max_domains(client, state, config, registry_domains)
+                except AuthenticationError:
+                    print("[auth] Session cookie expired, re-logging in...")
+                    client = reauth_client(config)
+                    target_ip, created = fill_to_max_domains(client, state, config, registry_domains)
+                persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
+                if created:
+                    print(f"[blocks-only] Filled {created} domain(s); active={len(state['active_domains'])}/{config['max_domains']}")
+                sleep_end = time.monotonic() + 60.0
+                while running and time.monotonic() < sleep_end:
+                    time.sleep(min(0.5, max(0.0, sleep_end - time.monotonic())))
+                continue
 
             if not is_in_active_hours(now, config):
                 next_rot = next_active_window_start(now, config)

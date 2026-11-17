@@ -9,6 +9,7 @@
   "weekly_enabled": true,
   "daily_enabled": false,
   "active_hours_only": false,
+  "blocks_only_enabled": false,
   "active_hours_start": "08:30",
   "active_hours_end": "15:20",
   "speed_multiplier": 1,
