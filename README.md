@@ -46,8 +46,8 @@ sudo loginctl enable-linger mitch
 ## No Target A Record (FreeDNS Update Script)
 Untick **Use Target A Record** (or set `"target_enabled": false`) when the rotator runs on a different server and the main server has no fixed A record. Then:
 - Run a FreeDNS dynamic-update script on the main server that updates **every** A record on the account (e.g. one driven by `https://freedns.afraid.org/api/?action=getdyndns&v=2&sha=...`, so newly created subdomains are picked up too).
-- New subdomains are created with the IP the update script has been setting (the most common IP across the account's records). Before any record has been updated, FreeDNS's default (the rotator's own IP) is used as a placeholder.
-- A domain counts as working only once it resolves to that learned IP; records still on their placeholder are never marked working.
+- New subdomains are created with a placeholder IP: `placeholder_ip` if set, otherwise FreeDNS's default (the rotator's own public IP). The update script then moves them to the server's IP.
+- A domain counts as working as soon as DNS returns any IP other than its placeholder. The IP most working domains resolve to is shown as the target IP.
 - Verify Nginx & Certbot uses `nginx_check_host` / `nginx_ssh_host`, falling back to the learned IP.
 
 ## Secure Nginx + Certbot Sync (`sync_nginx.py`, SSH-Only)

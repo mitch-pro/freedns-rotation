@@ -157,12 +157,9 @@ def resolve_target_ip(target_domain: str) -> str:
     return str(infos[0][4][0])
 
 
-IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$")
-
-
 def target_enabled(config: dict[str, Any]) -> bool:
     """True when new records point at target_domain's A record. When off, record IPs are
-    managed externally (FreeDNS dynamic update script on the server) and learned from the account."""
+    managed externally (FreeDNS dynamic update script on the server)."""
     return bool(config.get("target_enabled", True)) and bool(str(config.get("target_domain", "")).strip())
 
 
@@ -170,40 +167,49 @@ def target_label(config: dict[str, Any]) -> str:
     return str(config["target_domain"]).strip() if target_enabled(config) else "dynamic update script"
 
 
-def _is_placeholder(entry: dict[str, Any]) -> bool:
-    """Record still holds the throwaway IP it was created with (update script hasn't run on it yet)."""
-    ph = entry.get("placeholder_ip")
-    return bool(ph) and entry.get("address") == ph
+def creation_ip(config: dict[str, Any], target_ip: str) -> str:
+    """IP to create a new record with. Target off: a throwaway placeholder (`placeholder_ip`, or ''
+    = FreeDNS's form default, i.e. this rotator's public IP) that the update script overwrites."""
+    if target_enabled(config):
+        return target_ip
+    return str(config.get("placeholder_ip", "")).strip()
 
 
-def learned_dynamic_ip(state: dict[str, Any]) -> str:
-    """Most common IPv4 among account A records that the update script has already set
-    (i.e. not still at their creation placeholder). Remembered in state; '' if never seen."""
+def _placeholder_ips(entry: dict[str, Any], state: dict[str, Any], config: dict[str, Any]) -> set[str]:
+    ips = {str(entry.get("placeholder_ip", "")), str(state.get("placeholder_ip", "")),
+           str(config.get("placeholder_ip", "")).strip()}
+    return {ip for ip in ips if ip}
+
+
+def check_entry(
+    entry: dict[str, Any], target_ip: str, config: dict[str, Any], state: dict[str, Any]
+) -> tuple[bool, str]:
+    """(working?, resolved ip). Target on: must resolve to the record/target IP.
+    Target off: working as soon as DNS returns any IP other than the creation placeholder."""
+    ips = resolve_fqdn_ips(entry["fqdn"])
+    if target_enabled(config):
+        want = entry.get("address") or target_ip
+        return bool(want) and want in ips, want
+    real = sorted(ips - _placeholder_ips(entry, state, config))
+    return bool(real), (real[0] if real else "")
+
+
+def note_dynamic_ip(state: dict[str, Any]) -> None:
+    """Remember the IP most working domains resolve to (shown in the UI / used as nginx check host)."""
     counts: dict[str, int] = {}
     for d in state.get("active_domains", []):
-        addr = str(d.get("address", "")).strip()
-        if d.get("record_type", "A") == "A" and IPV4_RE.match(addr) and not _is_placeholder(d):
-            counts[addr] = counts.get(addr, 0) + 1
+        ip = d.get("resolved_ip") if d.get("working") else None
+        if ip:
+            counts[ip] = counts.get(ip, 0) + 1
     if counts:
         state["dynamic_ip"] = max(counts, key=lambda ip: counts[ip])
-    return str(state.get("dynamic_ip", ""))
 
 
 def current_target_ip(config: dict[str, Any], state: dict[str, Any]) -> str:
-    """IP new records should point to. Target on: resolve target_domain. Target off: the IP the
-    update script has been setting ('' if unknown yet -> FreeDNS form default, fixed by the script)."""
+    """Target on: resolve target_domain. Target off: the IP the update script has set ('' if unseen)."""
     if target_enabled(config):
         return resolve_target_ip(str(config["target_domain"]).strip())
-    return learned_dynamic_ip(state)
-
-
-def expected_ip(entry: dict[str, Any], target_ip: str, config: dict[str, Any]) -> str:
-    """IP an entry must resolve to to count as working."""
-    if target_enabled(config):
-        return entry.get("address") or target_ip
-    if target_ip:
-        return target_ip
-    return "" if _is_placeholder(entry) else str(entry.get("address", ""))
+    return str(state.get("dynamic_ip", ""))
 
 
 def resolve_fqdn_ips(fqdn: str) -> set[str]:
@@ -399,8 +405,8 @@ def refresh_working_domains(
     now = utc_now()
 
     def _check(entry: dict[str, Any]) -> tuple[dict[str, Any], str, bool]:
-        want = expected_ip(entry, target_ip, config)
-        return entry, want, bool(want) and (want in resolve_fqdn_ips(entry["fqdn"]))
+        ok, want = check_entry(entry, target_ip, config, state)
+        return entry, want, ok
 
     with ThreadPoolExecutor(max_workers=10) as pool:
         for entry, want, ok in pool.map(_check, active):
@@ -408,10 +414,11 @@ def refresh_working_domains(
                 if not entry.get("working"):
                     entry["working"] = True
                     entry["verified_at"] = now.isoformat()
-                    entry["resolved_ip"] = want
                     print(f"[working] {entry['fqdn']} now resolves to {want}")
+                entry["resolved_ip"] = want
             else:
                 entry["working"] = False
+    note_dynamic_ip(state)
 
 
 def prune_unverified_domains(
@@ -824,7 +831,7 @@ def create_unique_subdomain(
                 subdomain=prefix,
                 domain_id=parent.domain_id,
                 domain_name=parent.domain,
-                ip_address=target_ip,
+                ip_address=creation_ip(config, target_ip),
                 record_type="A",
             )
             state["taken_fqdns"] = sorted(taken_fqdns)[-2000:]
@@ -838,9 +845,10 @@ def create_unique_subdomain(
                 "created_at": utc_now().isoformat(),
                 "source": source_kind,
             }
-            if not target_ip:
-                # Created with FreeDNS's default IP; the dynamic update script will overwrite it.
+            if not target_enabled(config):
+                # Placeholder until the dynamic update script overwrites it; working once DNS differs.
                 entry["placeholder_ip"] = rec.address
+                state["placeholder_ip"] = rec.address
             print(f"[created:{source_kind}] {rec.fqdn} -> {rec.address} (id={rec.data_id})")
             return entry
         except SubdomainTakenError:

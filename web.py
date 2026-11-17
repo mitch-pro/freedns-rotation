@@ -12,6 +12,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import threading
@@ -52,9 +53,9 @@ from rotate import (
     refresh_working_domains,
     resolve_fqdn_ips,
     resolve_timezone,
+    check_entry,
     current_target_ip,
-    expected_ip,
-    learned_dynamic_ip,
+    note_dynamic_ip,
     target_enabled,
     target_label,
     resolve_target_ip,
@@ -387,14 +388,15 @@ class RotatorController:
         with self.lock:
             cfg = dict(self.config)
             snapshot = [dict(d) for d in self.state["active_domains"]]
-            dynamic_ip = "" if target_enabled(cfg) else learned_dynamic_ip(self.state)
+            dynamic_ip = "" if target_enabled(cfg) else str(self.state.get("dynamic_ip", ""))
+            st_view = {"placeholder_ip": self.state.get("placeholder_ip", "")}
 
         target_ip = resolve_target_ip(str(cfg["target_domain"]).strip()) if target_enabled(cfg) else dynamic_ip
         results: dict[str, tuple[str, bool]] = {}
         if snapshot:
             def _check(entry: dict[str, Any]) -> tuple[str, str, bool]:
-                expected = expected_ip(entry, target_ip, cfg)
-                return entry["fqdn"], expected, bool(expected) and (expected in resolve_fqdn_ips(entry["fqdn"]))
+                ok, ip = check_entry(entry, target_ip, cfg, st_view)
+                return entry["fqdn"], ip, ok
 
             with ThreadPoolExecutor(max_workers=10) as pool:
                 for fqdn, expected, ok in pool.map(_check, snapshot):
@@ -413,10 +415,14 @@ class RotatorController:
                     if not entry.get("working"):
                         entry["working"] = True
                         entry["verified_at"] = now.isoformat()
-                        entry["resolved_ip"] = expected
                         self.log(f"{entry['fqdn']} now resolves to {expected}")
+                    entry["resolved_ip"] = expected
                 else:
                     entry["working"] = False
+            if not target_enabled(cfg):
+                note_dynamic_ip(self.state)
+                target_ip = str(self.state.get("dynamic_ip", ""))
+                self._cached_target_ip = target_ip
             max_age_hours = float(self.config.get("unverified_max_age_hours", 24))
             cutoff = timedelta(hours=max(0.1, max_age_hours))
             has_expired = any(
@@ -619,6 +625,12 @@ class RotatorController:
                 self.config["target_domain"] = str(updates["target_domain"]).strip()
             if "target_enabled" in updates:
                 self.config["target_enabled"] = bool(updates["target_enabled"])
+            if "placeholder_ip" in updates:
+                ph = str(updates["placeholder_ip"]).strip()
+                if ph and not re.fullmatch(r"(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)", ph):
+                    self.log(f"Warning: placeholder IP {ph!r} is not a valid IPv4 address; ignored.")
+                else:
+                    self.config["placeholder_ip"] = ph
             self._cached_target_ip_at = 0.0
             if "word_list" in updates:
                 raw = updates["word_list"]
@@ -709,6 +721,7 @@ class RotatorController:
                 "target_domain": target_label(self.config),
                 "target_domain_raw": str(self.config.get("target_domain", "")),
                 "target_enabled": target_enabled(self.config),
+                "placeholder_ip": str(self.config.get("placeholder_ip", "")),
                 "target_ip": target_ip or "unknown (awaiting update script)",
                 "max_domains": int(self.config["max_domains"]),
                 "weekly_enabled": bool(self.config.get("weekly_enabled", True)),
@@ -924,6 +937,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div><label class="label">Speed Multiplier (1 = real-time)<input id="cfgSpeed" type="number" step="any"></label></div>
       <div><label class="label">Max Domains<input id="cfgMax" type="number"></label></div>
       <div><label class="label">Target Domain (A record)<input id="cfgTargetDomain" type="text" placeholder="mitch.pro"></label></div>
+      <div><label class="label">Placeholder IP (target off; blank = this server's IP)<input id="cfgPlaceholderIp" type="text" placeholder="e.g. 192.0.2.1"></label></div>
       <div><label class="label">SSH User<input id="cfgSshUser" type="text" placeholder="root"></label></div>
       <div><label class="label">SSH Host<input id="cfgSshHost" type="text" placeholder="mitch.pro"></label></div>
       <div><label class="label">SSH Port<input id="cfgSshPort" type="number" placeholder="22"></label></div>
@@ -1060,6 +1074,7 @@ async function saveConfig() {
     timezone: document.getElementById('cfgTz').value,
     target_enabled: document.getElementById('cfgTargetEnabled').checked,
     target_domain: document.getElementById('cfgTargetDomain').value,
+    placeholder_ip: document.getElementById('cfgPlaceholderIp').value,
     nginx_sync_enabled: document.getElementById('cfgNginxSync').checked,
     nginx_ssh_user: document.getElementById('cfgSshUser').value,
     nginx_ssh_host: document.getElementById('cfgSshHost').value,
@@ -1190,6 +1205,7 @@ async function refresh() {
     document.getElementById('cfgTz').value = d.timezone || '';
     document.getElementById('cfgTargetEnabled').checked = !!d.target_enabled;
     document.getElementById('cfgTargetDomain').value = d.target_domain_raw || '';
+    document.getElementById('cfgPlaceholderIp').value = d.placeholder_ip || '';
     document.getElementById('cfgNginxSync').checked = !!d.nginx_sync_enabled;
     document.getElementById('cfgSshUser').value = d.nginx_ssh_user || 'root';
     document.getElementById('cfgSshHost').value = d.nginx_ssh_host || '';
