@@ -3,6 +3,7 @@
   "password": "",
   "dns_cookie": "",
   "target_domain": "mitch.pro",
+  "target_enabled": true,
   "max_domains": 55,
   "weekly_enabled": true,
   "daily_enabled": false,

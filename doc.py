@@ -95,7 +95,7 @@ def doc_id_match_targets(url: str) -> list[str]:
 
 
 def build_payload(config: dict[str, Any], domains: list[dict[str, Any]]) -> dict[str, Any]:
-    target = str(config.get("target_domain", "")).strip()
+    target = str(config.get("target_domain", "")).strip() if config.get("target_enabled", True) else ""
     title = str(config.get("doc_title_prefix", "Working Domains")).strip() or "Working Domains"
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return {

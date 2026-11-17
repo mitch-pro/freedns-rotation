@@ -205,6 +205,13 @@ class FreeDNSClient:
                 "FreeDNS presented a CAPTCHA on subdomain creation; manual intervention required."
             )
 
+        if not ip_address:
+            # No target IP known (dynamic mode before the update script has run): use the
+            # address FreeDNS pre-fills (the requester's IP); the update script replaces it.
+            ip_address = self._form_default_address(edit_resp.text)
+            if not ip_address:
+                raise FreeDNSError("No target IP and FreeDNS form had no default address to use.")
+
         payload: dict[str, str] = {
             "domain_id": str(domain_id),
             "subdomain": subdomain,
@@ -269,6 +276,14 @@ class FreeDNSClient:
         resp.raise_for_status()
         if "zc.php" in resp.url or "action=auth" in resp.text:
             raise AuthenticationError("Session expired (redirected to login).")
+
+    @staticmethod
+    def _form_default_address(page_html: str) -> str:
+        for tag in re.findall(r"<input[^>]*>", page_html, re.I):
+            if re.search(r'name=["\']?address["\'\s>/]', tag, re.I):
+                m = re.search(r'value=["\']?([^"\'\s>]*)', tag, re.I)
+                return html.unescape(m.group(1)).strip() if m else ""
+        return ""
 
     @staticmethod
     def _has_captcha(page_html: str) -> bool:

@@ -157,6 +157,55 @@ def resolve_target_ip(target_domain: str) -> str:
     return str(infos[0][4][0])
 
 
+IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$")
+
+
+def target_enabled(config: dict[str, Any]) -> bool:
+    """True when new records point at target_domain's A record. When off, record IPs are
+    managed externally (FreeDNS dynamic update script on the server) and learned from the account."""
+    return bool(config.get("target_enabled", True)) and bool(str(config.get("target_domain", "")).strip())
+
+
+def target_label(config: dict[str, Any]) -> str:
+    return str(config["target_domain"]).strip() if target_enabled(config) else "dynamic update script"
+
+
+def _is_placeholder(entry: dict[str, Any]) -> bool:
+    """Record still holds the throwaway IP it was created with (update script hasn't run on it yet)."""
+    ph = entry.get("placeholder_ip")
+    return bool(ph) and entry.get("address") == ph
+
+
+def learned_dynamic_ip(state: dict[str, Any]) -> str:
+    """Most common IPv4 among account A records that the update script has already set
+    (i.e. not still at their creation placeholder). Remembered in state; '' if never seen."""
+    counts: dict[str, int] = {}
+    for d in state.get("active_domains", []):
+        addr = str(d.get("address", "")).strip()
+        if d.get("record_type", "A") == "A" and IPV4_RE.match(addr) and not _is_placeholder(d):
+            counts[addr] = counts.get(addr, 0) + 1
+    if counts:
+        state["dynamic_ip"] = max(counts, key=lambda ip: counts[ip])
+    return str(state.get("dynamic_ip", ""))
+
+
+def current_target_ip(config: dict[str, Any], state: dict[str, Any]) -> str:
+    """IP new records should point to. Target on: resolve target_domain. Target off: the IP the
+    update script has been setting ('' if unknown yet -> FreeDNS form default, fixed by the script)."""
+    if target_enabled(config):
+        return resolve_target_ip(str(config["target_domain"]).strip())
+    return learned_dynamic_ip(state)
+
+
+def expected_ip(entry: dict[str, Any], target_ip: str, config: dict[str, Any]) -> str:
+    """IP an entry must resolve to to count as working."""
+    if target_enabled(config):
+        return entry.get("address") or target_ip
+    if target_ip:
+        return target_ip
+    return "" if _is_placeholder(entry) else str(entry.get("address", ""))
+
+
 def resolve_fqdn_ips(fqdn: str) -> set[str]:
     """Return all IPv4 addresses fqdn currently resolves to, or empty set."""
     try:
@@ -313,7 +362,7 @@ def write_active_domains_file(
     lines = [
         "# FreeDNS Active Domains",
         f"# Updated:       {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"# Target A IP:   {target_ip} ({config['target_domain']})",
+        f"# Target A IP:   {target_ip or 'unknown'} ({target_label(config)})",
         f"# Active Count:  {len(active)} / {config['max_domains']}",
         f"# Schedule:      {config.get('rotation_mode', 'weekly')} "
         f"({config['weekday_rotations_per_day']}/day weekdays, "
@@ -350,18 +399,17 @@ def refresh_working_domains(
     now = utc_now()
 
     def _check(entry: dict[str, Any]) -> tuple[dict[str, Any], str, bool]:
-        expected_ip = entry.get("address") or target_ip
-        resolved_ips = resolve_fqdn_ips(entry["fqdn"])
-        return entry, expected_ip, (expected_ip in resolved_ips)
+        want = expected_ip(entry, target_ip, config)
+        return entry, want, bool(want) and (want in resolve_fqdn_ips(entry["fqdn"]))
 
     with ThreadPoolExecutor(max_workers=10) as pool:
-        for entry, expected_ip, ok in pool.map(_check, active):
+        for entry, want, ok in pool.map(_check, active):
             if ok:
                 if not entry.get("working"):
                     entry["working"] = True
                     entry["verified_at"] = now.isoformat()
-                    entry["resolved_ip"] = expected_ip
-                    print(f"[working] {entry['fqdn']} now resolves to {expected_ip}")
+                    entry["resolved_ip"] = want
+                    print(f"[working] {entry['fqdn']} now resolves to {want}")
             else:
                 entry["working"] = False
 
@@ -417,7 +465,7 @@ def write_working_domains_file(
     lines = [
         "# FreeDNS Verified Working Domains",
         f"# Updated:        {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"# Target A IP:    {target_ip} ({config['target_domain']})",
+        f"# Target A IP:    {target_ip or 'unknown'} ({target_label(config)})",
         f"# Working Count:  {len(working_pairs)} / {len(active)} active",
         "",
         f"{'#':<4} {'FQDN':<38} {'Resolved IP':<16} "
@@ -649,7 +697,7 @@ def rotate_blocked_domains(
     if not compiled_blocks:
         return []
 
-    target_ip = resolve_target_ip(config["target_domain"])
+    target_ip = current_target_ip(config, state)
     rotated: list[tuple[str, str]] = []
     remaining: list[dict[str, Any]] = []
 
@@ -790,6 +838,9 @@ def create_unique_subdomain(
                 "created_at": utc_now().isoformat(),
                 "source": source_kind,
             }
+            if not target_ip:
+                # Created with FreeDNS's default IP; the dynamic update script will overwrite it.
+                entry["placeholder_ip"] = rec.address
             print(f"[created:{source_kind}] {rec.fqdn} -> {rec.address} (id={rec.data_id})")
             return entry
         except SubdomainTakenError:
@@ -809,8 +860,8 @@ def rotate_once(
     registry_domains: list[RegistryDomain],
 ) -> str:
     """Delete oldest subdomain if at max_domains, then create one unique subdomain."""
-    target_ip = resolve_target_ip(config["target_domain"])
     sync_state_with_account(client, state)
+    target_ip = current_target_ip(config, state)
 
     max_domains = int(config["max_domains"])
     active = sorted(state["active_domains"], key=lambda d: d["created_at"])
@@ -848,8 +899,8 @@ def fill_to_max_domains(
     registry_domains: list[RegistryDomain],
 ) -> tuple[str, int]:
     """Create unique subdomains until active_domains reaches max_domains."""
-    target_ip = resolve_target_ip(config["target_domain"])
     sync_state_with_account(client, state)
+    target_ip = current_target_ip(config, state)
 
     max_domains = int(config["max_domains"])
     active = sorted(state["active_domains"], key=lambda d: d["created_at"])
@@ -896,15 +947,19 @@ def check_https(fqdn: str, host: str, timeout: float = 8.0) -> str | None:
         return f"connection: {exc}"
 
 
-def check_nginx_sync(fqdns: list[str], config: dict[str, Any]) -> dict[str, str]:
+def check_nginx_sync(
+    fqdns: list[str], config: dict[str, Any], state: dict[str, Any] | None = None
+) -> dict[str, str]:
     """Return {fqdn: error} for every fqdn that the nginx server doesn't serve with a valid cert."""
     if not fqdns:
         return {}
     host = (
         str(config.get("nginx_check_host", "")).strip()
         or str(config.get("nginx_ssh_host", "")).strip()
-        or resolve_target_ip(config["target_domain"])
+        or current_target_ip(config, state or {})
     )
+    if not host:
+        raise RuntimeError("No host to check: set nginx_check_host or nginx_ssh_host (target A record is off).")
     with ThreadPoolExecutor(max_workers=16) as pool:
         results = pool.map(lambda f: (f, check_https(f, host)), fqdns)
     return {f: err for f, err in results if err}
@@ -1084,7 +1139,7 @@ def import_account_domains(
         print(f"[imported] {rec.fqdn} -> {rec.address} (id={rec.data_id})")
 
     state["active_domains"].sort(key=lambda d: d["created_at"])
-    target_ip = resolve_target_ip(config["target_domain"])
+    target_ip = current_target_ip(config, state)
     refresh_working_domains(state, target_ip, config)
     return added, len(remote_records)
 
@@ -1137,7 +1192,7 @@ def main() -> int:
     )
 
     if args.status:
-        target_ip = resolve_target_ip(config["target_domain"])
+        target_ip = current_target_ip(config, state)
         refresh_working_domains(state, target_ip, config)
         persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
         print(active_path.read_text(encoding="utf-8"))
@@ -1147,14 +1202,14 @@ def main() -> int:
     client = build_client(config)
 
     if args.clear_all:
-        target_ip = resolve_target_ip(config["target_domain"])
+        target_ip = current_target_ip(config, state)
         deleted = clear_all_domains(client, state, config)
         persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
         print(f"[clear-all] Deleted {deleted} subdomain(s) from FreeDNS.")
         return 0
 
     if args.import_account:
-        target_ip = resolve_target_ip(config["target_domain"])
+        target_ip = current_target_ip(config, state)
         added, total = import_account_domains(client, state, config)
         persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
         print(f"[import] Added {added} new domain(s) ({total} total on FreeDNS account).")
@@ -1168,7 +1223,7 @@ def main() -> int:
         rotated = rotate_blocked_domains(
             client, state, config, registry_domains, compiled_blocks, compiled_allows
         )
-        target_ip = resolve_target_ip(config["target_domain"])
+        target_ip = current_target_ip(config, state)
         persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
         print(f"[rules] Loaded {len(words)} *word* prefixes, rotated {len(rotated)} blocked domain(s).")
         return 0
@@ -1199,7 +1254,7 @@ def main() -> int:
 
         print(
             f"[start] max={config['max_domains']} speed={config.get('speed_multiplier', 1)}x "
-            f"target={config['target_domain']}"
+            f"target={target_label(config)}"
         )
         last_rules_check = 0.0
         rules_interval = float(config.get("rules_check_interval_seconds", 300))
@@ -1216,7 +1271,7 @@ def main() -> int:
                         client, state, config, registry_domains, compiled_blocks, compiled_allows
                     )
                     if rotated:
-                        target_ip = resolve_target_ip(config["target_domain"])
+                        target_ip = current_target_ip(config, state)
                         persist_all_files(state_path, active_path, working_path, old_path, state, next_rot, target_ip, config)
                     print(f"[rules] Synced {len(words)} *word* prefixes; rotated {len(rotated)} blocked domain(s).")
                 except Exception as exc:

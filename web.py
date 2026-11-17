@@ -52,6 +52,11 @@ from rotate import (
     refresh_working_domains,
     resolve_fqdn_ips,
     resolve_timezone,
+    current_target_ip,
+    expected_ip,
+    learned_dynamic_ip,
+    target_enabled,
+    target_label,
     resolve_target_ip,
     rotate_blocked_domains,
     rotate_once,
@@ -361,7 +366,7 @@ class RotatorController:
     def fill_all(self) -> tuple[int, int]:
         with self.lock:
             client = self._ensure_client()
-            target_ip = resolve_target_ip(self.config["target_domain"])
+            target_ip = current_target_ip(self.config, self.state)
             created = 0
             try:
                 try:
@@ -380,19 +385,16 @@ class RotatorController:
 
     def refresh_dns(self) -> None:
         with self.lock:
-            target_domain = self.config["target_domain"]
-            snapshot = [
-                (d["fqdn"], d.get("address") or "")
-                for d in self.state["active_domains"]
-            ]
+            cfg = dict(self.config)
+            snapshot = [dict(d) for d in self.state["active_domains"]]
+            dynamic_ip = "" if target_enabled(cfg) else learned_dynamic_ip(self.state)
 
-        target_ip = resolve_target_ip(target_domain)
+        target_ip = resolve_target_ip(str(cfg["target_domain"]).strip()) if target_enabled(cfg) else dynamic_ip
         results: dict[str, tuple[str, bool]] = {}
         if snapshot:
-            def _check(item: tuple[str, str]) -> tuple[str, str, bool]:
-                fqdn, addr = item
-                expected = addr or target_ip
-                return fqdn, expected, (expected in resolve_fqdn_ips(fqdn))
+            def _check(entry: dict[str, Any]) -> tuple[str, str, bool]:
+                expected = expected_ip(entry, target_ip, cfg)
+                return entry["fqdn"], expected, bool(expected) and (expected in resolve_fqdn_ips(entry["fqdn"]))
 
             with ThreadPoolExecutor(max_workers=10) as pool:
                 for fqdn, expected, ok in pool.map(_check, snapshot):
@@ -442,7 +444,7 @@ class RotatorController:
         with self.lock:
             self.running = False
             client = self._ensure_client()
-            target_ip = resolve_target_ip(self.config["target_domain"])
+            target_ip = current_target_ip(self.config, self.state)
             try:
                 deleted = clear_all_domains(client, self.state, self.config)
             except AuthenticationError:
@@ -457,7 +459,7 @@ class RotatorController:
     def import_account(self) -> tuple[int, int]:
         with self.lock:
             client = self._ensure_client()
-            target_ip = resolve_target_ip(self.config["target_domain"])
+            target_ip = current_target_ip(self.config, self.state)
             try:
                 added, total = import_account_domains(client, self.state, self.config)
             except AuthenticationError:
@@ -479,7 +481,7 @@ class RotatorController:
 
         with self.lock:
             trigger_nginx_sync(self.state, self.config, self.base_dir, force=True, log=collect)
-            target_ip = resolve_target_ip(self.config["target_domain"])
+            target_ip = current_target_ip(self.config, self.state)
             self._persist(target_ip)
             self.log("Synced working domains to Nginx & Certbot.")
         return lines
@@ -510,7 +512,7 @@ class RotatorController:
                         self._client, self.state, self.config, self._registry, compiled_blocks, compiled_allows
                     )
             if rotated or words:
-                target_ip = resolve_target_ip(self.config["target_domain"])
+                target_ip = current_target_ip(self.config, self.state)
                 self._persist(target_ip)
             self.log(f"Rules sync: {len(words)} *word* prefixes, rotated {len(rotated)} blocked domain(s).")
 
@@ -563,7 +565,7 @@ class RotatorController:
         """Check every verified-working domain serves valid HTTPS; sync if any don't."""
         with self.lock:
             fqdns = syncable_fqdns(self.state, self.config)
-        failing = check_nginx_sync(fqdns, self.config)  # network checks run outside the lock
+        failing = check_nginx_sync(fqdns, self.config, self.state)  # network checks run outside the lock
         result: dict[str, Any] = {"checked": len(fqdns), "failing": sorted(failing), "synced": False}
         if not failing:
             self.log(f"Sync check: all {len(fqdns)} working domain(s) serve valid HTTPS.")
@@ -574,7 +576,7 @@ class RotatorController:
         sync_lines = self.sync_nginx()
         reasons = parse_sync_failures("\n".join(l.removeprefix("[sync] ") for l in sync_lines))
         result["synced"] = True
-        still = check_nginx_sync(sorted(failing), self.config)
+        still = check_nginx_sync(sorted(failing), self.config, self.state)
         result["still_failing"] = still
         result["sync_errors"] = {f: reasons[f] for f in still if f in reasons}
         if still:
@@ -615,6 +617,9 @@ class RotatorController:
                 self.config["max_domains"] = max(1, int(updates["max_domains"]))
             if "target_domain" in updates and str(updates["target_domain"]).strip():
                 self.config["target_domain"] = str(updates["target_domain"]).strip()
+            if "target_enabled" in updates:
+                self.config["target_enabled"] = bool(updates["target_enabled"])
+            self._cached_target_ip_at = 0.0
             if "word_list" in updates:
                 raw = updates["word_list"]
                 if isinstance(raw, str):
@@ -644,7 +649,7 @@ class RotatorController:
             now = utc_now()
             self.next_rot = advance_rotation_time(now, self.config)
             self.state["next_rotation_at"] = self.next_rot.isoformat()
-            target_ip = resolve_target_ip(self.config["target_domain"])
+            target_ip = current_target_ip(self.config, self.state)
             self._persist(target_ip)
             self.log("Configuration updated.")
 
@@ -654,7 +659,7 @@ class RotatorController:
             now_mono = time.monotonic()
             if (now_mono - self._cached_target_ip_at) >= 60.0 or self._cached_target_ip == "unresolved":
                 try:
-                    self._cached_target_ip = resolve_target_ip(self.config["target_domain"])
+                    self._cached_target_ip = current_target_ip(self.config, self.state)
                     self._cached_target_ip_at = now_mono
                 except Exception:
                     pass
@@ -701,8 +706,10 @@ class RotatorController:
             return {
                 "running": self.running,
                 "last_error": self._last_error,
-                "target_domain": self.config["target_domain"],
-                "target_ip": target_ip,
+                "target_domain": target_label(self.config),
+                "target_domain_raw": str(self.config.get("target_domain", "")),
+                "target_enabled": target_enabled(self.config),
+                "target_ip": target_ip or "unknown (awaiting update script)",
                 "max_domains": int(self.config["max_domains"]),
                 "weekly_enabled": bool(self.config.get("weekly_enabled", True)),
                 "daily_enabled": bool(self.config.get("daily_enabled", False)),
@@ -873,7 +880,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="grid">
     <div class="card"><div class="label">Target A Record</div><div class="val mono" id="targetIp">-</div><div class="sub" id="targetDomain">-</div></div>
     <div class="card"><div class="label">Active Domains</div><div class="val" id="activeCount">-</div><div class="sub">Max cap enforced</div></div>
-    <div class="card"><div class="label">Verified Working</div><div class="val" id="workingCount">0</div><div class="sub">DNS resolves to target</div></div>
+    <div class="card"><div class="label">Verified Working</div><div class="val" id="workingCount">0</div><div class="sub">DNS resolves to target IP</div></div>
     <div class="card"><div class="label">Retired Domains</div><div class="val" id="oldCount">0</div><div class="sub">Never reused</div></div>
     <div class="card"><div class="label">Next Rotation</div><div class="val" id="nextIn">-</div><div class="sub" id="nextAt">-</div></div>
   </div>
@@ -903,6 +910,9 @@ HTML_PAGE = """<!DOCTYPE html>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
         <input id="cfgActiveHours" type="checkbox" style="width:auto;margin:0;"> Active Hours Only (08:30–15:20, no weekends)
       </label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;" title="Off: new records are created with the last IP your FreeDNS update script set (or FreeDNS's default), and the update script on your server keeps them current.">
+        <input id="cfgTargetEnabled" type="checkbox" style="width:auto;margin:0;"> Use Target A Record (off = IP set by FreeDNS update script)
+      </label>
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
         <input id="cfgNginxSync" type="checkbox" style="width:auto;margin:0;"> Auto-Sync Nginx &amp; Certbot (SSH)
       </label>
@@ -913,6 +923,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="settings-grid">
       <div><label class="label">Speed Multiplier (1 = real-time)<input id="cfgSpeed" type="number" step="any"></label></div>
       <div><label class="label">Max Domains<input id="cfgMax" type="number"></label></div>
+      <div><label class="label">Target Domain (A record)<input id="cfgTargetDomain" type="text" placeholder="mitch.pro"></label></div>
       <div><label class="label">SSH User<input id="cfgSshUser" type="text" placeholder="root"></label></div>
       <div><label class="label">SSH Host<input id="cfgSshHost" type="text" placeholder="mitch.pro"></label></div>
       <div><label class="label">SSH Port<input id="cfgSshPort" type="number" placeholder="22"></label></div>
@@ -1047,6 +1058,8 @@ async function saveConfig() {
     daily_enabled: document.getElementById('cfgDaily').checked,
     active_hours_only: document.getElementById('cfgActiveHours').checked,
     timezone: document.getElementById('cfgTz').value,
+    target_enabled: document.getElementById('cfgTargetEnabled').checked,
+    target_domain: document.getElementById('cfgTargetDomain').value,
     nginx_sync_enabled: document.getElementById('cfgNginxSync').checked,
     nginx_ssh_user: document.getElementById('cfgSshUser').value,
     nginx_ssh_host: document.getElementById('cfgSshHost').value,
@@ -1175,6 +1188,8 @@ async function refresh() {
     document.getElementById('cfgDaily').checked = !!d.daily_enabled;
     document.getElementById('cfgActiveHours').checked = !!d.active_hours_only;
     document.getElementById('cfgTz').value = d.timezone || '';
+    document.getElementById('cfgTargetEnabled').checked = !!d.target_enabled;
+    document.getElementById('cfgTargetDomain').value = d.target_domain_raw || '';
     document.getElementById('cfgNginxSync').checked = !!d.nginx_sync_enabled;
     document.getElementById('cfgSshUser').value = d.nginx_ssh_user || 'root';
     document.getElementById('cfgSshHost').value = d.nginx_ssh_host || '';
