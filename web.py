@@ -697,6 +697,8 @@ class RotatorController:
                 self.config["doc_publish_enabled"] = bool(updates["doc_publish_enabled"])
             if "doc_webapp_url" in updates:
                 self.config["doc_webapp_url"] = str(updates["doc_webapp_url"]).strip()
+            if "doc_title" in updates:
+                self.config["doc_title"] = " ".join(str(updates["doc_title"]).split())[:200]
             if "doc_emails" in updates:
                 self.config["doc_emails"] = normalize_emails_doc(updates["doc_emails"])
             if "doc_publish_interval_seconds" in updates:
@@ -794,6 +796,7 @@ class RotatorController:
                 "doc_publish_enabled": bool(self.config.get("doc_publish_enabled", False)),
                 "doc_webapp_url": str(self.config.get("doc_webapp_url", "")),
                 "doc_emails": normalize_emails_doc(self.config.get("doc_emails", [])),
+                "doc_title": str(self.config.get("doc_title") or self.config.get("doc_title_prefix") or "Working Domains"),
                 "doc_auth_password_set": bool(str(self.config.get("doc_auth_password", ""))),
                 "doc_publish_interval_seconds": int(self.config.get("doc_publish_interval_seconds", 3600)),
                 "doc_current_url": self._doc_url,
@@ -1006,6 +1009,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div style="grid-column: span 2;"><label class="label">Doc Web App URL (Apps Script /exec)<input id="cfgDocUrl" type="text" placeholder="https://script.google.com/macros/s/.../exec"></label></div>
       <div><label class="label">Doc Auth Password<input id="cfgDocPw" type="password" placeholder="(unchanged)" autocomplete="new-password"></label></div>
       <div><label class="label">Doc Publish Interval (sec)<input id="cfgDocInterval" type="number" min="60" placeholder="3600"></label></div>
+      <div style="grid-column: span 2;"><label class="label">Document Name (applied on next update; use New Google Doc + Reshare to force a fresh doc)<input id="cfgDocTitle" type="text" maxlength="200" placeholder="Working Domains"></label></div>
       <div style="grid-column: span 2;"><label class="label">Doc Share Emails (comma-separated)<input id="cfgDocEmails" type="text" placeholder="a@example.com, b@example.com"></label></div>
       <div><button class="primary" style="width:100%" onclick="saveConfig()">Save Settings</button></div>
     </div>
@@ -1149,6 +1153,7 @@ async function saveConfig() {
     doc_publish_enabled: document.getElementById('cfgDocPublish').checked,
     doc_webapp_url: document.getElementById('cfgDocUrl').value,
     doc_emails: document.getElementById('cfgDocEmails').value,
+    doc_title: document.getElementById('cfgDocTitle').value,
     doc_publish_interval_seconds: parseInt(document.getElementById('cfgDocInterval').value || '3600', 10),
     doc_auth_password: document.getElementById('cfgDocPw').value
   });
@@ -1280,6 +1285,7 @@ async function refresh() {
     document.getElementById('cfgBanned').value = (d.banned_domains || []).join(', ');
     document.getElementById('cfgDocPublish').checked = !!d.doc_publish_enabled;
     document.getElementById('cfgDocUrl').value = d.doc_webapp_url || '';
+    document.getElementById('cfgDocTitle').value = d.doc_title || '';
     document.getElementById('cfgDocEmails').value = (d.doc_emails || []).join(', ');
     document.getElementById('cfgDocInterval').value = d.doc_publish_interval_seconds || 3600;
     document.getElementById('cfgDocPw').placeholder = d.doc_auth_password_set ? '(unchanged — set)' : '(not set)';

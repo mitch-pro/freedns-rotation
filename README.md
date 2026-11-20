@@ -88,6 +88,7 @@ The **Verify Nginx & Certbot** button opens an HTTPS connection to the nginx ser
 
 ## Google Doc Publisher (`doc.py` + `google_doc_publisher.gs`)
 Publishes the current working domains and their expiry times to a Google Doc.
+- Set the **Document Name** in the settings panel; it is applied on the next update (or when a new doc is created).
 - **Routine publishes** (auto-publish interval, **Update Google Doc** button) rewrite the current doc in place: same URL, no sharing, so nobody gets emailed.
 - **A new doc is created and shared** (emailing the list), and the old docs trashed, only when there is no current doc yet, when GoGuardian blocks the current doc, or when you click **New Google Doc + Reshare**.
 - With **Active Hours Only** on, automatic new docs and shares wait until the next active-hours window. A manual **New Google Doc + Reshare** click goes out immediately.

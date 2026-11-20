@@ -57,6 +57,7 @@
   "doc_publish_enabled": false,
   "doc_webapp_url": "",
   "doc_auth_password": "",
+  "doc_title": "Working Domains",
   "doc_emails": [],
   "doc_publish_interval_seconds": 3600,
   "timezone": ""
